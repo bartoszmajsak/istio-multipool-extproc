@@ -1,0 +1,13 @@
+istio=1.29.7
+envoy=9fa78e6847260a53acd4e1dda0d28edf506a1b0a/1.37.6-dev/Clean/RELEASE/BoringSSL
+epp_image=ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.10.0
+epp_digest=sha256:2e516fa1310da7be59b82beb1445362139597d6d553ef04d546716abe3aaaa70
+echo_image=gcr.io/k8s-staging-gateway-api/echo-basic:v20251106-v1.3.0-263-g47c3435c
+echo_digest=sha256:597b2d0a63088aaeebc670b9086c044c43d8c062ba7b66ecebd0e9f5890fa051
+k6_image=grafana/k6:2.2.0
+k6_digest=sha256:9bd01d6941fca969cb61bb57d2da5ee9b385fe2aa8881df3798c196564d6ace6
+gateway_api=v1.4.1
+gie_crds=v1.5.0
+cluster=multipool-spike
+namespace=multipool-spike
+split=9:1

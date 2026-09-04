@@ -1,0 +1,116 @@
+# Gateway, InferencePools and the routes under test.
+#
+# Placeholders substituted by setup.sh: NAMESPACE_ CLASS_ GATEWAY_ HOSTNAME_
+#                                       WEIGHTA_ WEIGHTB_
+#
+# Compiled Envoy route names are "<namespace>.<httproute>.<rule index>" and the
+# virtual host is "<hostname>:80". Everything shares one hostname so all of it
+# lands in one virtual host and one route table.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: CLASS_
+spec:
+  controllerName: istio.io/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: GATEWAY_
+  namespace: NAMESPACE_
+  annotations:
+    # ClusterIP rather than the default LoadBalancer. The gateway is only ever
+    # called from inside the cluster, so there is nothing to expose, and not
+    # allocating an address is strictly safer than allocating one on a host
+    # where several kind clusters share a docker bridge. Istio still reports
+    # Programmed and still fills status.addresses from the ClusterIP.
+    networking.istio.io/service-type: ClusterIP
+spec:
+  gatewayClassName: CLASS_
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      allowedRoutes:
+        namespaces: {from: All}
+---
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: pool-a
+  namespace: NAMESPACE_
+spec:
+  appProtocol: http
+  selector:
+    matchLabels: {app: backend-a}
+  targetPorts:
+    - number: 3000
+  endpointPickerRef:
+    group: ""
+    kind: Service
+    name: epp-a
+    port: {number: 9002}
+    failureMode: FailClose
+---
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: pool-b
+  namespace: NAMESPACE_
+spec:
+  appProtocol: http
+  selector:
+    matchLabels: {app: backend-b}
+  targetPorts:
+    - number: 3000
+  endpointPickerRef:
+    group: ""
+    kind: Service
+    name: epp-b
+    port: {number: 9002}
+    failureMode: FailClose
+---
+# THE SUBJECT. One rule, two InferencePool backendRefs, 9:1. Istio compiles this
+# into one Envoy route with two weighted clusters and exactly one route-level
+# ext_proc override - naming pool B's picker, because B is the last non-zero
+# backendRef. Pool A's picker is never consulted for any of it.
+#
+# Same hostname, path and shape as the GIE conformance fixture
+# GatewayWeightedAcrossTwoInferencePools, which Istio passes.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: split
+  namespace: NAMESPACE_
+spec:
+  hostnames: [HOSTNAME_]
+  parentRefs:
+    - {group: gateway.networking.k8s.io, kind: Gateway, name: GATEWAY_, sectionName: http}
+  rules:
+    - matches: [{path: {type: PathPrefix, value: /weighted-two-pools-test}}]
+      backendRefs:
+        - {group: inference.networking.k8s.io, kind: InferencePool, name: pool-a, weight: WEIGHTA_}
+        - {group: inference.networking.k8s.io, kind: InferencePool, name: pool-b, weight: WEIGHTB_}
+---
+# POSITIVE CONTROL for pool A. Single backendRef, so pool A's picker owns the
+# whole rule and must be consulted for every request to it.
+#
+# Without this route, "picker A was invoked zero times" is indistinguishable
+# from "picker A is broken" - and with failure_mode_allow a dead picker still
+# yields 200s. It is also what turns the outage scenario from an inference into an
+# observation: pool A serving 200s here while the weighted rule is 100% down
+# proves the pool is healthy and the rule died for another reason.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: a-only
+  namespace: NAMESPACE_
+spec:
+  hostnames: [HOSTNAME_]
+  parentRefs:
+    - {group: gateway.networking.k8s.io, kind: Gateway, name: GATEWAY_, sectionName: http}
+  rules:
+    - matches: [{path: {type: PathPrefix, value: /a-only}}]
+      backendRefs:
+        - {group: inference.networking.k8s.io, kind: InferencePool, name: pool-a}

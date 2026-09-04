@@ -1,0 +1,14 @@
+.kubeconfig
+__pycache__/
+
+# results/ is rewritten completely by every run, and most of it is bulk that is
+# only meaningful against the cluster that produced it: config dumps carry
+# Istio-generated cluster hashes, access logs carry pod IPs, and a three-version
+# sweep is about 4MB of it.
+#
+# What is kept is what someone following a link from the issue actually wants -
+# the assertions with their numbers, stamped with the (istio, envoy) pair that
+# produced them. The rest regenerates with ./setup.sh && ./validate.sh --all.
+results/*/*
+!results/*/validate.out
+!results/*/versions.txt

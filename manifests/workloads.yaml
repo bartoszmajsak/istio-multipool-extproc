@@ -1,0 +1,252 @@
+# Backends, endpoint pickers and the burst client.
+#
+# Placeholders substituted by setup.sh: NAMESPACE_ K6IMAGE_ EPPIMAGE_ ECHOIMAGE_ REPLICAS_
+#
+# Two pools of echo servers and one real endpoint picker each. No model server,
+# no GPU - the pickers run happily against plain echo pods.
+#
+# The echo server is Gateway API conformance's own echo-basic. It reflects the
+# request headers and names the pod that answered, which is everything this
+# spike needs from a backend: the picker's chosen endpoint comes back in
+# X-Gateway-Destination-Endpoint, and the pod name says which pool served. Replica count matches the GIE conformance fixture so results
+# here are comparable to a conformance run that passes.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-a
+  namespace: NAMESPACE_
+spec:
+  replicas: REPLICAS_
+  selector:
+    matchLabels: {app: backend-a}
+  template:
+    metadata:
+      labels: {app: backend-a}
+    spec:
+      containers:
+        - name: echo
+          image: ECHOIMAGE_
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          ports: [{containerPort: 3000}]
+          readinessProbe:
+            httpGet: {path: /, port: 3000}
+            periodSeconds: 1
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-b
+  namespace: NAMESPACE_
+spec:
+  replicas: REPLICAS_
+  selector:
+    matchLabels: {app: backend-b}
+  template:
+    metadata:
+      labels: {app: backend-b}
+    spec:
+      containers:
+        - name: echo
+          image: ECHOIMAGE_
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          ports: [{containerPort: 3000}]
+          readinessProbe:
+            httpGet: {path: /, port: 3000}
+            periodSeconds: 1
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+---
+# Headless, so a picker resolving it gets the pod IPs Istio also programmed into
+# that pool's EDS cluster. A ClusterIP here would hand back one virtual address
+# that is in no cluster's endpoint set, and every selection would be discarded.
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-a-pods
+  namespace: NAMESPACE_
+spec:
+  clusterIP: None
+  selector: {app: backend-a}
+  ports: [{port: 3000, targetPort: 3000}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-b-pods
+  namespace: NAMESPACE_
+spec:
+  clusterIP: None
+  selector: {app: backend-b}
+  ports: [{port: 3000, targetPort: 3000}]
+---
+# RBAC for the endpoint pickers. This is a real EPP, so it watches its
+# InferencePool and the pods that pool selects - which is the one thing this
+# spike gains a controller for, and the reason the picker knows an endpoint set
+# at all.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: multipool-epp-reader
+rules:
+  - apiGroups: ["inference.networking.k8s.io", "inference.networking.x-k8s.io"]
+    resources: ["inferencepools", "inferencepools/status", "inferenceobjectives",
+                "inferencemodels", "inferencemodelrewrites"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods", "services", "namespaces"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: multipool-epp-reader
+subjects:
+  - {kind: ServiceAccount, name: default, namespace: NAMESPACE_}
+roleRef: {kind: ClusterRole, name: multipool-epp-reader, apiGroup: rbac.authorization.k8s.io}
+---
+# The real endpoint picker, one per pool. No stand-in: what this spike measures
+# is which picker Istio consults, and using the picker people actually run
+# removes the obvious objection to the result.
+#
+# --secure-serving=false is not optional. It defaults to TRUE, and Istio dials
+# the picker as plaintext h2c, so leaving it on produces
+# "ext_proc_error_gRPC_error_14 ... connection_termination" on every request -
+# a 500 that names TLS nowhere.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: epp-a
+  namespace: NAMESPACE_
+spec:
+  # Exactly one, asserted by validate.sh, so a picker's behaviour is one pod's
+  # behaviour and not an average over two.
+  replicas: 1
+  selector:
+    matchLabels: {app: epp-a}
+  template:
+    metadata:
+      labels: {app: epp-a}
+    spec:
+      containers:
+        - name: epp
+          image: EPPIMAGE_
+          imagePullPolicy: IfNotPresent
+          args:
+            - --pool-name=pool-a
+            - --pool-namespace=NAMESPACE_
+            - --grpc-port=9002
+            - --grpc-health-port=9003
+            - --secure-serving=false
+            - --metrics-endpoint-auth=false
+          ports:
+            - {containerPort: 9002, name: grpc}
+            - {containerPort: 9003, name: grpc-health}
+            - {containerPort: 9090, name: metrics}
+          readinessProbe:
+            grpc: {port: 9003}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: epp-b
+  namespace: NAMESPACE_
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: epp-b}
+  template:
+    metadata:
+      labels: {app: epp-b}
+    spec:
+      containers:
+        - name: epp
+          image: EPPIMAGE_
+          imagePullPolicy: IfNotPresent
+          args:
+            - --pool-name=pool-b
+            - --pool-namespace=NAMESPACE_
+            - --grpc-port=9002
+            - --grpc-health-port=9003
+            - --secure-serving=false
+            - --metrics-endpoint-auth=false
+          ports:
+            - {containerPort: 9002, name: grpc}
+            - {containerPort: 9003, name: grpc-health}
+            - {containerPort: 9090, name: metrics}
+          readinessProbe:
+            grpc: {port: 9003}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+---
+# appProtocol: http2 on the ext_proc port. ext_proc is gRPC, and without this
+# Istio dials the picker as HTTP/1.1 and every stream fails - which, with
+# failure_mode_allow, looks exactly like a picker that was never consulted.
+apiVersion: v1
+kind: Service
+metadata:
+  name: epp-a
+  namespace: NAMESPACE_
+spec:
+  selector: {app: epp-a}
+  ports:
+    - {name: grpc-ext-proc, port: 9002, targetPort: 9002, appProtocol: http2}
+    - {name: http-metrics, port: 9090, targetPort: 9090, appProtocol: http}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: epp-b
+  namespace: NAMESPACE_
+spec:
+  selector: {app: epp-b}
+  ports:
+    - {name: grpc-ext-proc, port: 9002, targetPort: 9002, appProtocol: http2}
+    - {name: http-metrics, port: 9090, targetPort: 9090, appProtocol: http}
+---
+# The load generator is k6, driving every target at once from inside the
+# cluster. In-cluster means no LoadBalancer address, no MetalLB and no
+# port-forward - and on a host running several kind clusters off one docker
+# bridge, a colliding LoadBalancer IP makes a gateway answer for routes it never
+# had, which is the same signature as the defect under investigation.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client
+  namespace: NAMESPACE_
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: client}
+  template:
+    metadata:
+      labels: {app: client}
+    spec:
+      containers:
+        - name: k6
+          image: K6IMAGE_
+          imagePullPolicy: IfNotPresent
+          command: ["sleep", "infinity"]
+          volumeMounts:
+            - {name: scripts, mountPath: /scripts}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+      volumes:
+        - name: scripts
+          configMap: {name: k6-scripts}

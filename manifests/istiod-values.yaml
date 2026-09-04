@@ -1,0 +1,40 @@
+# istiod values for the multi-pool ext_proc spike.
+#
+# The inference-extension flags are what make istiod compile an InferencePool
+# backendRef into an ext_proc filter at all - without them there is no
+# ExtProcPerRoute anywhere and the spike has nothing to measure. No Gateway
+# label is needed alongside them: Istio attaches the listener filter whenever a
+# Gateway has an InferencePool attached to it.
+pilot:
+  env:
+    ENABLE_GATEWAY_API_INFERENCE_EXTENSION: "true"
+    SUPPORT_GATEWAY_API_INFERENCE_EXTENSION: "true"
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+
+meshConfig:
+  accessLogFile: /dev/stdout
+  accessLogEncoding: JSON
+  # Pinned rather than inherited: the default JSON field set has changed between
+  # Istio minors and this spike compares minors against each other.
+  #
+  # Four fields carry claims no other channel can make:
+  #
+  #   upstream_host + upstream_service_time  empty on a 503 means the request
+  #       was refused before upstream selection - the endpoint picker said no,
+  #       rather than the model server being down. That distinction is the whole
+  #       of scenario 2.
+  #   response_code_details                  carries the picker's own
+  #       ImmediateResponse details string, so a 503 names who produced it.
+  #   route_name                             which compiled route served, which
+  #       is how scenario 4 proves the inserted route took over rather than the
+  #       original one having quietly changed.
+  #   ep_requested / ep_served               Envoy's own statement of which
+  #       endpoint the picker asked for and which one was actually used. When a
+  #       picker chooses a host outside the selected cluster, override_host
+  #       falls back to round robin and discards the choice: requested and
+  #       served disagree, and that disagreement is visible per request.
+  accessLogFormat: |
+    {"start_time":"%START_TIME%","method":"%REQ(:METHOD)%","path":"%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%","req_id":"%REQ(X-REQ-ID)%","response_code":"%RESPONSE_CODE%","response_flags":"%RESPONSE_FLAGS%","response_code_details":"%RESPONSE_CODE_DETAILS%","duration":"%DURATION%","upstream_service_time":"%RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%","upstream_host":"%UPSTREAM_HOST%","upstream_cluster":"%UPSTREAM_CLUSTER%","route_name":"%ROUTE_NAME%","authority":"%REQ(:AUTHORITY)%","ep_requested":"%DYNAMIC_METADATA(envoy.lb:x-gateway-destination-endpoint)%","ep_served":"%DYNAMIC_METADATA(envoy.lb:x-gateway-destination-endpoint-served)%"}

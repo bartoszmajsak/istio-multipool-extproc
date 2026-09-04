@@ -1,0 +1,28 @@
+Istio multi-pool ext_proc validation
+istio=1.30.2 envoy=1.38.3-dev
+Split:     pool-a=9 pool-b=1   requests per target: 100
+Gateway:   http://multipool-gw-multipool-istio.multipool-spike.svc.cluster.local   (host primary.example.com)
+Results:   /home/bartek/code/work/sandbox/istio-multipool-extproc/results/istio-1.30.2
+==> 1/3  both pools healthy, 9:1 across two InferencePools
+    sending 100 requests to the weighted rule, and 100 to pool-a's own route
+==> 2/3  scaling pool-b (the 10% canary) to zero, as during a rollout
+    probing continuously for 70s across the drain and the refill
+    pool-b has no endpoints
+    scaling pool-b back up
+    pool-b serving again; waiting for the probe to finish
+==> 3/3  same outage, with an EnvoyFilter giving each pool its own picker
+    rendering the filter from the route Envoy is running
+    patched route loaded; sending 100 requests
+    draining pool-b again, this time under the patch
+
+  1. two InferencePools behind one HTTPRoute rule, split 9:1, both healthy
+     pool-b's picker chose the endpoint for 100 of 100 requests, pool-a's for 0
+     each pool's picker should choose for its own share, so 90 and 10
+  2. pool-b (the 10% canary) scaled to zero, as during a rollout
+     163 of 163 requests on the rule failed over 10.8s, 89% of them bound for healthy pool-a
+     only pool-b's own 10% share should have failed, so about 16
+  3. same outage, with an EnvoyFilter giving each pool its own picker
+     11 of 100 requests failed - pool-b's share only, pool-a served throughout
+     which is what emptying a 10% member should cost
+
+  every assertion held   evidence: /home/bartek/code/work/sandbox/istio-multipool-extproc/results/istio-1.30.2
