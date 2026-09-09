@@ -163,10 +163,16 @@ ok "gateway programmed, service ${GW_SVC}.${NS}.svc.cluster.local"
 # plane pushed until something makes it re-subscribe, and a scenario scored in that
 # window describes the build that is no longer installed. Restarting it is the one
 # step that guarantees the config came from the istiod just installed.
-if kubectl -n "$NS" get deploy -l gateway.networking.k8s.io/gateway-name -o name 2>/dev/null | grep -q .; then
-    info "Restarting the gateway so its config comes from the istiod just installed"
-    kubectl -n "$NS" rollout restart deploy -l gateway.networking.k8s.io/gateway-name >/dev/null 2>&1 || true
-    kubectl -n "$NS" rollout status deploy -l gateway.networking.k8s.io/gateway-name --timeout=180s >/dev/null 2>&1 || true
+# A restart that quietly failed would leave exactly the state this guards against,
+# and the check below cannot notice: the proxy image is already the expected one.
+# So a failure here is fatal rather than tolerated.
+_gw_deploy="$(gateway_deployment)"
+if [[ -n "$_gw_deploy" ]]; then
+    info "Restarting $_gw_deploy so its config comes from the istiod just installed"
+    kubectl -n "$NS" rollout restart "deploy/$_gw_deploy" >/dev/null \
+        || err "could not restart $_gw_deploy; it would keep serving the route table the previous control plane pushed"
+    kubectl -n "$NS" rollout status "deploy/$_gw_deploy" --timeout=180s >/dev/null \
+        || err "$_gw_deploy did not come back after the restart; a scenario scored now would describe the control plane that was just replaced"
 fi
 
 info "Waiting for the gateway proxy to match istiod $ISTIO_VERSION"
