@@ -59,10 +59,13 @@ Reproducer is using the same cluster, same manifests, same `proxyv2:1.30.4`. ist
 |---|---|---|---|
 | `collide-a` | two HTTPRoutes reusing one rule name | served pool-a, **picked by pool-b** | picked by pool-a |
 | `collide-b` | the other half of that pair | pool-b | pool-b |
-| `split` | one rule, two weighted pools | picker A invoked 0 of 100 | 38 a / 2 b, each by its own picker |
+| `split` | one rule, two weighted pools | picker A invoked 0 of 100 | 35 a / 5 b, each by its own picker |
 
 Every request returned 200 in both columns. Nothing about the responses says which one you
 are looking at, which is the point.
+
+The right-hand column is `quay.io/bmajsak/pilot:1.30.4-fix-61594`, which carries the change
+in #61601 on top of 1.30.4. Reproduce it with the `--istiod-image` invocation below.
 
 ## Run it
 
@@ -72,19 +75,24 @@ are looking at, which is the point.
 ./validate.sh --verbose                               # plus the evidence each step rests on
 
 ./setup.sh --istio-version 1.29.7                     # another minor, same cluster
-./setup.sh --istiod-image localhost/pilot:pr61601     # a candidate control plane
+./setup.sh --istiod-image quay.io/bmajsak/pilot:1.30.4-fix-61594   # a candidate control plane
 ```
 
-`--istiod-image` loads a locally built image and patches the istiod deployment only. The
-chart's `global.hub`/`global.tag` are deliberately not used: those also name the proxy image
-istiod provisions for the gateway, and every fix this spike is concerned with lives in pilot.
-The gateway keeps the released `proxyv2`, so a comparison run differs by the control plane
-alone.
+`--istiod-image` takes a registry reference or a locally built image, pulling once if it is
+not already local and side-loading it either way, so a run does not depend on the cluster
+reaching a registry.
 
-To build one from an Istio checkout:
+It sets the image through the istiod chart's own `image` value, which names that container
+and nothing else. `global.hub`/`global.tag` would also name the proxy image istiod hands to
+the gateway, and only pilot is being replaced - the gateway keeps the released proxy, so a
+comparison differs by the control plane alone. Going through the chart also leaves the field
+owned by helm, so a second run upgrades over the first instead of conflicting with it.
+
+To build one from an Istio checkout instead:
 
 ```bash
-HUB=localhost TAG=pr61601 BUILD_WITH_CONTAINER=0 make docker.pilot   # ~35s, istiod only
+HUB=localhost TAG=mine BUILD_WITH_CONTAINER=0 make docker.pilot   # ~35s, istiod only
+./setup.sh --istiod-image localhost/pilot:mine
 ```
 
 `./validate.sh` prints its results and nothing else:

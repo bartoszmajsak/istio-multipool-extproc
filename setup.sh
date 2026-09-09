@@ -87,26 +87,27 @@ kubectl create namespace istio-system 2>/dev/null || true
 # conflict. Dropping it lets the chart own it again; the chart recreates it.
 kubectl delete validatingwebhookconfiguration istiod-default-validator --ignore-not-found >/dev/null 2>&1 || true
 helm upgrade --install istio-base istio/base -n istio-system --version "$ISTIO_VERSION" --wait >/dev/null
+istiod_image_args=()
 if [[ -n "$ISTIOD_IMAGE" ]]; then
+    # Takes a locally built image or a registry reference. Pull once if it is not
+    # already local, then side-load either way, so the run does not depend on the
+    # cluster reaching a registry and repeats offline.
     docker image inspect "$ISTIOD_IMAGE" >/dev/null 2>&1 \
-        || err "istiod image '$ISTIOD_IMAGE' is not in the local docker daemon"
+        || docker pull -q "$ISTIOD_IMAGE" >/dev/null \
+        || err "cannot find or pull istiod image '$ISTIOD_IMAGE'"
     kind load docker-image "$ISTIOD_IMAGE" --name "$CLUSTER_NAME" >/dev/null \
         || err "could not load '$ISTIOD_IMAGE' into the cluster"
+    # A full reference in the istiod chart's own `image` names that container and
+    # nothing else. global.hub/global.tag would also name the proxy image istiod
+    # hands to the gateway, and only pilot is being replaced here - the gateway
+    # keeps the released proxy, so a comparison differs by the control plane alone.
+    # Setting it through the chart rather than after it also leaves the field owned
+    # by helm, so the next run can upgrade over it instead of conflicting.
+    istiod_image_args=(--set "image=$ISTIOD_IMAGE" --set global.imagePullPolicy=IfNotPresent)
 fi
 helm upgrade --install istiod istio/istiod -n istio-system --version "$ISTIO_VERSION" \
-    -f "$MANIFESTS/istiod-values.yaml" --wait >/dev/null
-# Swap the deployment rather than the chart's hub/tag: those also name the proxy
-# image istiod provisions for the gateway, and only pilot is being replaced here.
-# The gateway keeps the released proxyv2 of ISTIO_VERSION, so the run differs from
-# a stock one by the control plane alone.
-if [[ -n "$ISTIOD_IMAGE" ]]; then
-    kubectl set image -n istio-system deployment/istiod "discovery=$ISTIOD_IMAGE" >/dev/null
-    kubectl patch deployment istiod -n istio-system --type=json \
-        -p '[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' >/dev/null
-    kubectl rollout status -n istio-system deployment/istiod --timeout=180s >/dev/null \
-        || err "istiod did not roll out on $ISTIOD_IMAGE"
-    info "istiod is running $ISTIOD_IMAGE; the gateway proxy stays on released $ISTIO_VERSION"
-fi
+    -f "$MANIFESTS/istiod-values.yaml" "${istiod_image_args[@]}" --wait >/dev/null
+[[ -n "$ISTIOD_IMAGE" ]] && info "istiod is running $ISTIOD_IMAGE; the gateway proxy stays on released $ISTIO_VERSION"
 kubectl wait --timeout=180s -n istio-system deployment/istiod --for=condition=Available >/dev/null \
     || err "istiod not ready"
 ok "istiod ${ISTIOD_IMAGE:-$ISTIO_VERSION} ready with the inference extension enabled"
