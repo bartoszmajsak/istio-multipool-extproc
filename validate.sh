@@ -45,6 +45,26 @@ docker_socket_guard
 
 SCENARIOS_ALL="bypass outage fix"
 mkdir -p "$RESULTS"
+
+# Record this run's own verdict beside the evidence it scored, pass or fail. The
+# file is what the issue links to, and nothing was writing it: a directory kept
+# whatever an earlier run had left there, and a run that failed left nothing at
+# all, which reads as a run that never happened. Colour codes are stripped so the
+# file is readable where it is quoted.
+_raw="$RESULTS/.validate.raw"
+exec > >(tee "$_raw"); _tee_pid=$!
+exec 2>&1
+_finish() {
+    local rc=$?
+    # Close the stream so tee sees EOF and flushes, then wait for it: reading the
+    # file while tee still holds it truncates the verdict this exists to keep.
+    exec >&- 2>&-
+    wait "$_tee_pid" 2>/dev/null
+    sed 's/\x1b\[[0-9;]*m//g' "$_raw" > "$RESULTS/validate.out" 2>/dev/null
+    rm -f "$_raw"
+    exit "$rc"
+}
+trap _finish EXIT
 rm -f "$RESULTS"/[0-9]-*.headline
 
 GW_POD="$(gateway_pod)"
