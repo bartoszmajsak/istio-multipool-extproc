@@ -63,9 +63,22 @@ MANIFESTS="${SCRIPT_DIR}/manifests"
 # A candidate control plane gets its own directory. Sharing one with the stock run
 # leaves a directory whose scored output describes one build and whose raw captures
 # came from another, and nothing in it says which.
-_results_slug="istio-${ISTIO_VERSION}"
-[[ -n "${ISTIOD_IMAGE:-}" ]] && _results_slug+="+$(printf '%s' "${ISTIOD_IMAGE##*/}" | tr ':/' '--')"
-RESULTS="${RESULTS:-${SCRIPT_DIR}/results/${_results_slug}}"
+# Read from the cluster rather than from ISTIOD_IMAGE: that variable is set by the
+# flag on setup.sh and does not survive the process, so a later validate.sh would
+# pick the stock directory and split one run across two. The running image is true
+# for whoever asks and for however they got here.
+istiod_running_image() {
+    kubectl -n istio-system get deploy istiod \
+        -o jsonpath='{.spec.template.spec.containers[?(@.name=="discovery")].image}' 2>/dev/null
+}
+results_slug() {
+    local slug="istio-${ISTIO_VERSION}" img="${ISTIOD_IMAGE:-$(istiod_running_image || true)}"
+    # A released pilot of the version already named by the slug adds nothing.
+    [[ -n "$img" && "$img" != */pilot:"${ISTIO_VERSION}" ]] \
+        && slug+="+$(printf '%s' "${img##*/}" | tr ':/' '--')"
+    printf '%s' "$slug"
+}
+RESULTS="${RESULTS:-${SCRIPT_DIR}/results/$(results_slug)}"
 
 # The topology mirrors the GIE conformance fixture
 # GatewayWeightedAcrossTwoInferencePools

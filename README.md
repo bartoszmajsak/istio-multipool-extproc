@@ -37,7 +37,7 @@ weights. You have only lost the picking, which was the point of the thing.
 It gets loud when the picker that won has nothing to pick from - canary still pulling its
 model, member scaled to zero, mid rolling update. It then rejects every request it is asked
 about, including all the traffic headed for the entirely healthy pool, and the whole rule
-503s. Status stays green throughout, naturally.
+503s. Sampled while the rule was down, every status still read healthy.
 
 Reproduced on Istio 1.29.7, 1.30.2 and 1.30.4 (Envoy 1.37.6-dev, 1.38.3-dev, 1.38.4-dev).
 

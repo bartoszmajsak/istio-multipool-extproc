@@ -327,6 +327,16 @@ def gate_split(rows, label, weight_a, weight_b):
 # Scenarios
 # --------------------------------------------------------------------------
 
+def parse_pool_ips(args):
+    out = {}
+    for spec in args.pool_ips:
+        pool, ips = spec.split("=", 1)
+        for ip in ips.split(","):
+            if ip:
+                out[ip.split(":")[0]] = pool
+    return out
+
+
 def check_selected_served(rows, access, label, what):
     """The endpoint the picker chose is the endpoint Envoy dialled.
 
@@ -425,12 +435,7 @@ def scenario_bypass(args, rows, routes, access):
               "no weighted cluster carries an ext_proc override (%s)"
               % (with_override or "none"))
 
-    pool_ips = {}
-    for spec in args.pool_ips:
-        pool, ips = spec.split("=", 1)
-        for ip in ips.split(","):
-            if ip:
-                pool_ips[ip.split(":")[0]] = pool
+    pool_ips = parse_pool_ips(args)
     logged = gate_access(rows, access, "split")
     to_pool_a = [r for r in logged if pool_of(r.get("upstream_cluster") or "") == "pool-a"]
     if check(len(to_pool_a) > 0,
@@ -728,6 +733,22 @@ def scenario_fix_outage(args, rows, routes, access):
     check(survivors and all(r["backend"] == "a" for r in survivors),
           "and every surviving request was served by the healthy pool (%d)"
           % len(survivors))
+
+    # An aggregate share is satisfied by the right number of failures anywhere. Join
+    # each one to the record Envoy wrote for it: a request that failed while routed
+    # to the healthy pool is the defect this scenario exists to show was fixed, and
+    # counting alone cannot tell it apart from the canary's own share failing.
+    logged = gate_access(rows, access, "split")
+    by_id = {a.get("req_id"): a for a in logged}
+    failed_rows = [r for r in split if r["code"] != "200"]
+    misattributed = [r for r in failed_rows
+                     if pool_of((by_id.get(r["req_id"], {}).get("upstream_cluster") or "")) != "pool-b"]
+    check(failed_rows and not misattributed,
+          "every failed request was routed to the emptied pool (%d of %d)%s"
+          % (len(failed_rows) - len(misattributed), len(failed_rows),
+             "" if not misattributed else "; %d were bound for the healthy pool"
+             % len(misattributed)))
+    check_selected_served(rows, access, "split", "under the patch, during the outage")
     show_failures(rows, access, "split")
     headline(args, "3-fix",
              "same outage, with an EnvoyFilter giving each pool its own picker\n"
