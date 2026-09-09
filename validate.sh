@@ -356,6 +356,8 @@ scenario_fix() {
     header "Scenario: fix - the outage re-run underneath the patch"
     substep "draining pool-b again, this time under the patch"
     drain_pool pool-b
+    capture "config_dump?resource=dynamic_route_configs" "$RESULTS/fix-outage-routes.json" \
+        || err "empty route capture"
     run_burst fix-outage "$RESULTS/fix-outage-traffic.log" "split=${SPLIT_PATH}${MODEL_PATH}"
     capture_access fix-outage "$RESULTS/fix-outage-access.log" $((REQUESTS * 1))
     score fix-outage

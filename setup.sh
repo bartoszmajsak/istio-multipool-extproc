@@ -179,6 +179,9 @@ image_digest() {
 cat > "$RESULTS/versions.txt" <<EOF
 istio=${ISTIO_VERSION}
 envoy=${ENVOY_VERSION}
+istiod_image=$(kubectl -n istio-system get deploy istiod -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo unknown)
+istiod_image_id=$(kubectl -n istio-system get pods -l app=istiod -o jsonpath='{.items[0].status.containerStatuses[0].imageID}' 2>/dev/null | sed 's/.*@//' || echo unknown)
+proxy_image=$(kubectl -n "$NS" get pods -l gateway.networking.k8s.io/gateway-name -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null || echo unknown)
 epp_image=${EPP_IMAGE}
 epp_digest=$(image_digest "$EPP_IMAGE")
 echo_image=${ECHO_IMAGE}

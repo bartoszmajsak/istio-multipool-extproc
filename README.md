@@ -128,8 +128,9 @@ compiled route carries a single route-level override:
 ```
 
 Neither `ClusterWeight` carries `typed_per_filter_config`. Note `failure_mode_allow` as well:
-the rule inherits one pool's picker *and* one pool's failure semantics, so a pool declaring
-`FailClose` runs `FailOpen` because another pool in the same rule said so.
+the rule inherits one pool's picker *and* one pool's failure semantics. Both pools here declare
+`FailClose`, so this spike shows the field being taken from one of them rather than a pool
+being flipped: a mixed pair would be needed to demonstrate a `FailClose` pool running open.
 
 ### Two routes, one rule name
 
@@ -212,6 +213,10 @@ Consequences:
   rule's traffic. Under the workaround below the same empty pool costs 10%.
 - **Not caught by conformance.** `GatewayWeightedAcrossTwoInferencePools` scores the answering
   pod and the weight split. The round-robin fallback keeps both correct.
+- **Not measured here.** The scenarios never reorder backendRefs, set a weight to zero, or
+  pair a `FailOpen` pool with a `FailClose` one, so those consequences are read from the code
+  above rather than demonstrated. Status is sampled once during the weighted outage, which
+  says the conditions were green at that moment, not that they never went red.
 - **A mixed `[InferencePool, Service]` rule is affected by the same overwrite** - a Service
   backendRef yields a nil config and `route_collections.go:103` gates ext_proc on it for the
   whole rule. Separate defect, not covered here.

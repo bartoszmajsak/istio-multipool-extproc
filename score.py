@@ -497,7 +497,7 @@ def scenario_outage(args, rows, routes, access, status):
     # against 1395 total and call it a miss.
     block("while pool-b had no endpoints")
     row("requests to the weighted rule", "%d, of which %d failed"
-        % (len(split), split_codes.get("503", 0) + split_codes.get("500", 0)))
+        % (len(split), len(split) - split_codes.get("200", 0)))
     row("requests to pool-a's own route (the control)", "%d, of which %d failed"
         % (len(ctl), len(ctl) - ctl_codes.get("200", 0)))
     show_failures(rows, access, "split")
@@ -570,7 +570,7 @@ def scenario_outage(args, rows, routes, access, status):
     for kind, name, condition, value in status:
         check(value == "True",
               "%s/%s %s=%s during the outage" % (kind, name, condition, value))
-    lost = 100.0 * split_codes.get("503", 0) / len(split) if split else 0.0
+    lost = 100.0 * (len(split) - split_codes.get("200", 0)) / len(split) if split else 0.0
     share_a = globals().get("_KILLED_SHARE_A", 0.0)
     win = outage_window(rows, "split")
     secs = (win[1] - win[0]) / 1000.0 if win else 0.0
@@ -681,7 +681,10 @@ def scenario_fix_outage(args, rows, routes, access):
     block("the same outage, with the patch in place")
     for code, n in sorted(codes.items()):
         row("HTTP %s" % code, n)
-    failed = codes.get("503", 0)
+    # Anything that is not a 200 is a failed request. Counting only 503 would read a
+    # run of 500s - an ext_proc stream torn down rather than an endpoint refused -
+    # as a clean run, and zero failures sits inside the band around the canary's share.
+    failed = len(split) - codes.get("200", 0)
     share = 100.0 * failed / len(split) if split else 100.0
     expected = 100.0 * args.weight_b / (args.weight_a + args.weight_b)
     tolerance = band(args.weight_b / float(args.weight_a + args.weight_b), len(split))

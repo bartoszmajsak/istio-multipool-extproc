@@ -60,7 +60,12 @@ ECHO_IMAGE="${ECHO_IMAGE:-gcr.io/k8s-staging-gateway-api/echo-basic:v20251106-v1
 K6_IMAGE="${K6_IMAGE:-grafana/k6:2.2.0}"
 
 MANIFESTS="${SCRIPT_DIR}/manifests"
-RESULTS="${RESULTS:-${SCRIPT_DIR}/results/istio-${ISTIO_VERSION}}"
+# A candidate control plane gets its own directory. Sharing one with the stock run
+# leaves a directory whose scored output describes one build and whose raw captures
+# came from another, and nothing in it says which.
+_results_slug="istio-${ISTIO_VERSION}"
+[[ -n "${ISTIOD_IMAGE:-}" ]] && _results_slug+="+$(printf '%s' "${ISTIOD_IMAGE##*/}" | tr ':/' '--')"
+RESULTS="${RESULTS:-${SCRIPT_DIR}/results/${_results_slug}}"
 
 # The topology mirrors the GIE conformance fixture
 # GatewayWeightedAcrossTwoInferencePools
