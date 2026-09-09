@@ -78,6 +78,9 @@ results_slug() {
         && slug+="+$(printf '%s' "${img##*/}" | tr ':/' '--')"
     printf '%s' "$slug"
 }
+# Remember whether the caller pinned this, so setup can re-resolve after it has
+# installed a control plane without overriding an explicit choice.
+[[ -n "${RESULTS:-}" ]] && RESULTS_PINNED=1 || RESULTS_PINNED=""
 RESULTS="${RESULTS:-${SCRIPT_DIR}/results/$(results_slug)}"
 
 # The topology mirrors the GIE conformance fixture

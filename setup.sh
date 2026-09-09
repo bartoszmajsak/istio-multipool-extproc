@@ -105,9 +105,25 @@ if [[ -n "$ISTIOD_IMAGE" ]]; then
     # by helm, so the next run can upgrade over it instead of conflicting.
     istiod_image_args=(--set "image=$ISTIOD_IMAGE" --set global.imagePullPolicy=IfNotPresent)
 fi
+# A kubectl set image on istiod - the obvious way to try another build by hand -
+# takes server-side-apply ownership of that field, and every later chart upgrade
+# then fails on a conflict rather than on anything about the run. Hand the field
+# back by dropping the deployment; the chart recreates it.
+# --show-managed-fields: kubectl strips them from -o json by default, so without it
+# this check silently never fires.
+if kubectl -n istio-system get deploy istiod --show-managed-fields -o json 2>/dev/null \
+    | grep -q '"manager": *"kubectl-set"'; then
+    info "clearing a hand-set istiod image so the chart can own it again"
+    kubectl delete deployment istiod -n istio-system --ignore-not-found >/dev/null
+fi
 helm upgrade --install istiod istio/istiod -n istio-system --version "$ISTIO_VERSION" \
     -f "$MANIFESTS/istiod-values.yaml" "${istiod_image_args[@]}" --wait >/dev/null
 [[ -n "$ISTIOD_IMAGE" ]] && info "istiod is running $ISTIOD_IMAGE; the gateway proxy stays on released $ISTIO_VERSION"
+# Re-resolve now that the intended control plane is the one running. Resolving at
+# source time reads whatever the previous run left installed, so a stock install over
+# a candidate would file its results under the candidate while the validate that
+# follows files under stock.
+[[ -z "$RESULTS_PINNED" ]] && RESULTS="${SCRIPT_DIR}/results/$(results_slug)"
 kubectl wait --timeout=180s -n istio-system deployment/istiod --for=condition=Available >/dev/null \
     || err "istiod not ready"
 ok "istiod ${ISTIOD_IMAGE:-$ISTIO_VERSION} ready with the inference extension enabled"
@@ -141,6 +157,17 @@ GW_SVC=$(kubectl get svc -n "$NS" \
     -o jsonpath='{.items[0].metadata.name}')
 [[ -n "$GW_SVC" ]] || err "no Service found for gateway $GATEWAY_NAME"
 ok "gateway programmed, service ${GW_SVC}.${NS}.svc.cluster.local"
+
+# The proxy image is unchanged by an istiod swap, so waiting on it says nothing about
+# whose config the gateway is serving. It keeps the route table the previous control
+# plane pushed until something makes it re-subscribe, and a scenario scored in that
+# window describes the build that is no longer installed. Restarting it is the one
+# step that guarantees the config came from the istiod just installed.
+if kubectl -n "$NS" get deploy -l gateway.networking.k8s.io/gateway-name -o name 2>/dev/null | grep -q .; then
+    info "Restarting the gateway so its config comes from the istiod just installed"
+    kubectl -n "$NS" rollout restart deploy -l gateway.networking.k8s.io/gateway-name >/dev/null 2>&1 || true
+    kubectl -n "$NS" rollout status deploy -l gateway.networking.k8s.io/gateway-name --timeout=180s >/dev/null 2>&1 || true
+fi
 
 info "Waiting for the gateway proxy to match istiod $ISTIO_VERSION"
 GW_IMAGE=$(wait_for_gateway_proxy 240) \

@@ -749,6 +749,16 @@ def scenario_fix_outage(args, rows, routes, access):
              "" if not misattributed else "; %d were bound for the healthy pool"
              % len(misattributed)))
     check_selected_served(rows, access, "split", "under the patch, during the outage")
+
+    # Without this the scenario cannot tell the patch apart from its absence: the
+    # per-pool numbers above are equally consistent with the original route serving
+    # the traffic, which is the arrangement this run exists to show was replaced.
+    check(routes.get(args.fixed_route) is not None,
+          "the patched route %s is in the route table Envoy was running"
+          % args.fixed_route)
+    served_by_route = collections.Counter(r.get("route_name") for r in logged)
+    check(set(served_by_route) == {args.fixed_route},
+          "and Envoy served every request from it (%s)" % dict(served_by_route))
     show_failures(rows, access, "split")
     headline(args, "3-fix",
              "same outage, with an EnvoyFilter giving each pool its own picker\n"
