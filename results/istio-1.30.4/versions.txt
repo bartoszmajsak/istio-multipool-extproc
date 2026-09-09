@@ -1,5 +1,8 @@
 istio=1.30.4
 envoy=ce177c56fe75661f16b654e2f164d4ab02058222/1.38.4-dev/Clean/RELEASE/BoringSSL
+istiod_image=registry.istio.io/release/pilot:1.30.4
+istiod_image_id=sha256:c236c1df5cc127fe193e5a17d8ece9cdd0dc17c5d89b4e20baf01d464f029dce
+proxy_image=registry.istio.io/release/proxyv2:1.30.4
 epp_image=ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.10.0
 epp_digest=sha256:2e516fa1310da7be59b82beb1445362139597d6d553ef04d546716abe3aaaa70
 echo_image=gcr.io/k8s-staging-gateway-api/echo-basic:v20251106-v1.3.0-263-g47c3435c
