@@ -9,15 +9,27 @@ FAIL: split: pool b's picker chose the endpoint for 100% of the rule, both pools
 FAIL: split: 0 of 100 requests were served by one pool while the other pool's picker was consulted
 FAIL: route-level ext_proc override names epp-b (None)
 FAIL: no weighted cluster carries an ext_proc override (['pool-a', 'pool-b'])
-FAIL: every one of them was handed an endpoint from pool B by picker b (0 of 92)
+FAIL: every one of them was handed an endpoint from pool B by picker b (0 of 90)
 ==> 2/3  scaling pool-b (the 10% canary) to zero, as during a rollout
     probing continuously for 70s across the drain and the refill
     pool-b has no endpoints
     scaling pool-b back up
     pool-b serving again; waiting for the probe to finish
-FAIL: split: nothing succeeded while pool b had no endpoints - including the 90% share whose weighted cluster is the healthy pool A (164 requests)
-FAIL: 0 of the 18 dead requests (0.0%, the healthy pool's own weight share) had already been routed to pool A's cluster when picker b refused on their behalf
+FAIL: split: nothing succeeded while pool b had no endpoints - including the 90% share whose weighted cluster is the healthy pool A (163 requests)
+FAIL: 0 of the 31 dead requests (0.0%, the healthy pool's own weight share) had already been routed to pool A's cluster when picker b refused on their behalf
 ==> 3/3  same outage, with an EnvoyFilter giving each pool its own picker
     rendering the filter from the route Envoy is running
-no route splits across two or more InferencePools with a route-level ext_proc override; the defect this patches is not present
-FAIL: could not render the EnvoyFilter
+no route splits across two or more InferencePools under a single route-level ext_proc override
+WARN: nothing to patch: no rule splits across two InferencePools under one picker
+
+  1. two InferencePools behind one HTTPRoute rule, split 9:1, both healthy
+     pool-b's picker chose the endpoint for 10 of 100 requests, pool-a's for 90
+     each pool's picker should choose for its own share, so 90 and 10
+  2. pool-b (the 10% canary) scaled to zero, as during a rollout
+     22 of 163 requests on the rule failed over 10.6s, 0% of them bound for healthy pool-a
+     only pool-b's own 10% share should have failed, so about 16
+
+  this control plane does not exhibit the defect
+  7 assertion(s) failed because each one expects it. This runner
+  reproduces the defect; it does not validate a fix - see the README.
+  evidence: /home/bartek/code/work/sandbox/istio-multipool-extproc/results/istio-1.30.4+pilot-1.30.4-fix-61594

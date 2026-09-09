@@ -610,21 +610,26 @@ def scenario_outage(args, rows, routes, access, status):
     share_a = globals().get("_KILLED_SHARE_A", 0.0)
     win = outage_window(rows, "split")
     secs = (win[1] - win[0]) / 1000.0 if win else 0.0
-    dead = len(split)
-    expect = int(round(dead * args.weight_b / float(args.weight_a + args.weight_b)))
+    # Count the failures rather than assuming the window is entirely made of them.
+    # Passing the window size as the failure count states the scenario's expected
+    # outcome instead of its measured one, and reads as a total outage on a control
+    # plane where only the emptied member's share actually failed.
+    dead = len(split) - split_codes.get("200", 0)
+    expect = int(round(len(split) * args.weight_b / float(args.weight_a + args.weight_b)))
     headline(args, "2-outage",
              "pool-b (the %d%% canary) scaled to zero, as during a rollout\n"
              "     %d of %d requests on the rule failed over %.1fs, %.0f%% of them "
              "bound for healthy pool-a\n"
              "     only pool-b's own %d%% share should have failed, so about %d"
              % (round(100.0 * args.weight_b / (args.weight_a + args.weight_b)),
-                dead, dead, secs, share_a,
+                dead, len(split), secs, share_a,
                 round(100.0 * args.weight_b / (args.weight_a + args.weight_b)), expect))
-    verdict("while the 10%% member had no endpoints, nothing on the rule succeeded -\n"
-            "         %d requests over %.1fs, %.0f%% of which had already been routed to\n"
+    verdict("while the 10%% member had no endpoints, %d of %d requests on the rule\n"
+            "         failed over %.1fs, %.0f%% of which had already been routed to\n"
             "         the healthy pool's cluster. Pool a served 200s on its own route\n"
             "         throughout, and the rule recovered by itself once the pool came\n"
-            "         back. Every Kubernetes condition stayed True." % (win[2], secs, share_a))
+            "         back. Every Kubernetes condition stayed True."
+            % (dead, len(split), secs, share_a))
 
 
 def scenario_fix(args, rows, routes, access, edits, stats, edits_doc=None):

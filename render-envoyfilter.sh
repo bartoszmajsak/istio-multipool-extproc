@@ -144,8 +144,12 @@ for vhost_name, route in targets:
 duplicated = len(targets) - len(unique)
 targets = unique
 if not targets:
-    sys.exit("no route splits across two or more InferencePools with a route-level "
-             "ext_proc override; the defect this patches is not present")
+    # Exit 3, not 1: there is nothing wrong here, there is simply nothing to patch.
+    # The caller reports it as a finding about the control plane rather than a failure
+    # to produce the filter.
+    sys.stderr.write("no route splits across two or more InferencePools under a single "
+                     "route-level ext_proc override\n")
+    sys.exit(3)
 
 
 def override_naming(source, picker):

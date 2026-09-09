@@ -355,8 +355,17 @@ scenario_fix() {
     substep "rendering the filter from the route Envoy is running"
     local rejected_before rejected_after
     rejected_before=$(rds_rejected)
-    "$SCRIPT_DIR/render-envoyfilter.sh" >/dev/null \
-        || err "could not render the EnvoyFilter"
+    # `|| render_rc=$?` rather than a bare call: set -e would take the exit 3 the
+    # renderer uses to say the defect is absent and end the run there, which is the
+    # abrupt stop this branch exists to replace.
+    local render_rc=0
+    "$SCRIPT_DIR/render-envoyfilter.sh" >/dev/null || render_rc=$?
+    if [[ "$render_rc" -eq 3 ]]; then
+        DEFECT_ABSENT=1
+        warn "nothing to patch: no rule splits across two InferencePools under one picker"
+        return 0
+    fi
+    [[ "$render_rc" -eq 0 ]] || err "could not render the EnvoyFilter"
     kubectl apply -f "$RESULTS/envoyfilter-per-pool-extproc.yaml" >/dev/null 2>&1 \
         || err "EnvoyFilter rejected by the API server"
     wait_for_route "$FIXED_ROUTE_NAME" 60 \
@@ -415,6 +424,14 @@ done
 echo ""
 if [[ "$TOTAL_FAILURES" -eq 0 ]]; then
     echo -e "  ${GREEN}every assertion held${NC}   evidence: $RESULTS"
+elif [[ -n "${DEFECT_ABSENT:-}" ]]; then
+    # Every assertion here states that the defect is present, so a control plane that
+    # has been fixed fails them by definition. Saying only "N failed" invites the
+    # reader to conclude the opposite of what happened.
+    echo -e "  ${GREEN}this control plane does not exhibit the defect${NC}"
+    echo -e "  ${TOTAL_FAILURES} assertion(s) failed because each one expects it. This runner"
+    echo -e "  reproduces the defect; it does not validate a fix - see the README."
+    echo -e "  evidence: $RESULTS"
 else
     echo -e "  ${RED}${BOLD}${TOTAL_FAILURES} assertion(s) failed${NC}   evidence: $RESULTS"
 fi

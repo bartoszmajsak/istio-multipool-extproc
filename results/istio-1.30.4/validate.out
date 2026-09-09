@@ -19,7 +19,7 @@ Results:   /home/bartek/code/work/sandbox/istio-multipool-extproc/results/istio-
      pool-b's picker chose the endpoint for 100 of 100 requests, pool-a's for 0
      each pool's picker should choose for its own share, so 90 and 10
   2. pool-b (the 10% canary) scaled to zero, as during a rollout
-     163 of 163 requests on the rule failed over 10.8s, 87% of them bound for healthy pool-a
+     164 of 164 requests on the rule failed over 10.8s, 93% of them bound for healthy pool-a
      only pool-b's own 10% share should have failed, so about 16
   3. same outage, with an EnvoyFilter giving each pool its own picker
      13 of 100 requests failed - pool-b's share only, pool-a served throughout
