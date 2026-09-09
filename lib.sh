@@ -33,6 +33,12 @@ GATEWAY_NAME="${GATEWAY_NAME:-multipool-gw}"
 export KUBECONFIG="${KUBECONFIG:-${SCRIPT_DIR}/.kubeconfig}"
 
 ISTIO_VERSION="${ISTIO_VERSION:-1.30.4}"
+# A locally built istiod image to run instead of the released one, for trying a
+# control-plane change against the scenarios here. Every fix this spike is
+# concerned with lives in pilot, so only istiod is swapped - the gateway proxy
+# stays on the released proxyv2 of ISTIO_VERSION, and the comparison is that one
+# variable.
+ISTIOD_IMAGE="${ISTIOD_IMAGE:-}"
 GATEWAY_API_VERSION="${GATEWAY_API_VERSION:-v1.4.1}"
 GIE_VERSION="${GIE_VERSION:-v1.5.0}"
 

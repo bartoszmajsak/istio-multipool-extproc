@@ -114,3 +114,46 @@ spec:
     - matches: [{path: {type: PathPrefix, value: /a-only}}]
       backendRefs:
         - {group: inference.networking.k8s.io, kind: InferencePool, name: pool-a}
+---
+# COLLIDING RULE NAMES across two HTTPRoutes - the shared-gateway shape.
+#
+# Distinct from the weighted rule above: no rule here references more than one
+# InferencePool, and the two routes share no backendRefs at all. What they share
+# is a rule NAME. Gateway API only requires rule names to be unique within one
+# HTTPRoute (see the spec's HTTPRouteRule.name), so this is valid, and it is what
+# a controller emitting a fixed set of rule names produces for every service it
+# manages.
+#
+# Istio keys its per-rule InferencePool config by that name and merges the map
+# across every route on the gateway, so the two entries collide. The matches stay
+# distinct - /collide-a and /collide-b route to their own pools - while the picker
+# config resolved for them does not.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: collide-a
+  namespace: NAMESPACE_
+spec:
+  hostnames: [HOSTNAME_]
+  parentRefs:
+    - {group: gateway.networking.k8s.io, kind: Gateway, name: GATEWAY_, sectionName: http}
+  rules:
+    - name: v1-completions-path
+      matches: [{path: {type: PathPrefix, value: /collide-a}}]
+      backendRefs:
+        - {group: inference.networking.k8s.io, kind: InferencePool, name: pool-a}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: collide-b
+  namespace: NAMESPACE_
+spec:
+  hostnames: [HOSTNAME_]
+  parentRefs:
+    - {group: gateway.networking.k8s.io, kind: Gateway, name: GATEWAY_, sectionName: http}
+  rules:
+    - name: v1-completions-path
+      matches: [{path: {type: PathPrefix, value: /collide-b}}]
+      backendRefs:
+        - {group: inference.networking.k8s.io, kind: InferencePool, name: pool-b}

@@ -1,124 +1,93 @@
 # Istio multi-pool ext_proc misassociation
 
-One HTTPRoute rule with two InferencePool backendRefs gets one endpoint picker. The other
-pool's picker is never invoked. When the pool that owns the picker has no ready endpoints,
-the whole rule returns 503 and takes the entire traffic down.
+Every `InferencePool` ships with its own endpoint picker - a small service the gateway asks,
+once per request, "which replica should take this one?". That is the entire reason to use an
+InferencePool. The picker knows which replica already has your prompt prefix cached and which
+one is drowning.
+
+So the gateway needs to ask the right pool's picker. There are two fairly ordinary ways it
+doesn't.
+
+**One rule, two pools.** The usual canary - 90/10 across two pools in a single route rule.
+Istio attaches one picker per *rule*, not per backend, so one pool's picker answers for all
+of it:
+
+```
+rule  ->  90% pool-a  \
+                       >-- both ask pool-b's picker
+          10% pool-b  /
+```
+
+**Two routes, one rule name.** Different services, different pools, nothing shared - except a
+rule name. Gateway API only asks that names be unique inside a single HTTPRoute, so reusing
+them across routes is perfectly legal. Istio keys each picker by that name and merges the
+routes, and whichever lands last takes the name, along with the other service's picker:
+
+```
+route-a  rule "v1-completions-path"  ->  pool-a  \
+                                                  >-- one entry survives
+route-b  rule "v1-completions-path"  ->  pool-b  /
+```
+
+The annoying part is that while both pools are healthy, none of this shows. The wrong picker
+names an endpoint that isn't in the cluster Envoy selected, so Envoy ignores it and
+round-robins instead, and the right pod answers anyway. 200s all round, split matches the
+weights. You have only lost the picking, which was the point of the thing.
+
+It gets loud when the picker that won has nothing to pick from - canary still pulling its
+model, member scaled to zero, mid rolling update. It then rejects every request it is asked
+about, including all the traffic headed for the entirely healthy pool, and the whole rule
+503s. Status stays green throughout, naturally.
 
 Reproduced on Istio 1.29.7, 1.30.2 and 1.30.4 (Envoy 1.37.6-dev, 1.38.3-dev, 1.38.4-dev).
 
-## Observation
-
-Rule: `[pool-a weight 9, pool-b weight 1]`, both `InferencePool`, each with its own endpoint
-picker. Compiled route from `config_dump?resource=dynamic_route_configs`:
-
-```json
-{
-  "name": "multipool-spike.split.0",
-  "route": { "weighted_clusters": { "clusters": [
-      { "name": "outbound|54321||pool-a-ip-8934303d...", "weight": 9 },
-      { "name": "outbound|54321||pool-b-ip-574c3c50...", "weight": 1 } ] } },
-  "typed_per_filter_config": {
-    "envoy.filters.http.ext_proc": {
-      "@type": "...ext_proc.v3.ExtProcPerRoute",
-      "overrides": {
-        "grpc_service": { "envoy_grpc": { "cluster_name": "outbound|9002||epp-b..." } },
-        "failure_mode_allow": false } } }
-}
-```
-
-Verifiable without this harness, against any cluster with the route applied:
-
-```bash
-kubectl exec -n <ns> <gateway-pod> -c istio-proxy -- \
-  curl -s localhost:15000/config_dump?resource=dynamic_route_configs \
-| jq -r '.configs[].route_config.virtual_hosts[].routes[]
-    | select(.route.weighted_clusters)
-    | {route: .name,
-       route_level_picker: (.typed_per_filter_config."envoy.filters.http.ext_proc"
-                            .overrides.grpc_service.envoy_grpc.cluster_name // "none"),
-       per_cluster: [.route.weighted_clusters.clusters[]
-                     | {cluster: (.name|split("||")[1]|split(".")[0]), weight,
-                        picker: (.typed_per_filter_config."envoy.filters.http.ext_proc" // "none")}]}'
-```
-
-```json
-{
-  "route": "multipool-spike.split.0",
-  "route_level_picker": "outbound|9002||epp-b.multipool-spike.svc.cluster.local",
-  "per_cluster": [
-    { "cluster": "pool-a-ip-8934303d", "weight": 9, "picker": "none" },
-    { "cluster": "pool-b-ip-574c3c50", "weight": 1, "picker": "none" }
-  ]
-}
-```
-
-- One `ExtProcPerRoute`, at route level, naming `epp-b` only.
-- Neither `ClusterWeight` carries `typed_per_filter_config`.
-- 100 requests: pool B's picker chose the endpoint for all 100. Pool A's picker for 0, while
-  answering 100 on its own single-pool route in the same burst.
-- 85 of 100 were served by a pool A pod while pool B's picker chose their endpoint.
-- All 200. Weight split within band of 9:1.
-
-```
-1788529724098 split 200 backend-a-679d48bf78-s2n87 10.244.0.20:3000 bypass...-split-0
-                        ^ answered by pool A       ^ picker chose this, a pool B endpoint
-```
-
-Envoy's access log, for requests whose `upstream_cluster` is pool A's:
-`ep_requested` is a pool B endpoint, `upstream_host` a pool A one.
-
-With pool B scaled to zero, all 100 requests return 503; 84 of them had already been routed
-to pool A's cluster:
-
-```
-response_code 503   response_flags -   upstream_host null   upstream_cluster ...pool-a-ip-...
-```
-
-Gateway `Programmed`, HTTPRoute `Accepted`, both InferencePools `Accepted` remain `True`
-throughout, asserted during the outage window.
-
-## Reasons and consequences
-
-Source at istio/istio `b1c58947`.
-
-| Fact | Where |
-|---|---|
-| `ExtProcPerRoute` is only ever constructed at route level | `route.go:514-521`, the sole non-test construction |
-| `ClusterWeight` never gets `TypedPerFilterConfig` | `processWeightedDestination`, `route.go:747` |
-| Picker is the last backendRef processed, unguarded overwrite | `conversion.go:1008` (`ipCfg = ipconfig`) |
-| Zero-weight refs pruned before that loop | `conversion.go:993` |
-
-Consequences:
-
-- **The winner is the last non-zero-weight backendRef** (from `conversion.go:1008` and
-  `:993`; not exercised by the suite). Reordering backendRefs changes which picker runs, and
-  `weight: 0` removes a member from contention, so ownership moves during a rollback to 0.
-- **Endpoint selection is discarded for the majority share.** The picker returns an endpoint
-  from its own pool; that host is not in the selected cluster; `override_host` falls back to
-  round robin. Load-aware routing is inoperative for traffic not bound to the picker's own
-  pool, with no error.
-- **One empty member fails the whole rule.** A picker with no ready endpoints must return
-  `ImmediateResponse` 503 ([EPP protocol](https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/main/docs/proposals/004-endpoint-picker-protocol/README.md)).
-  It does so for every request on the rule, so emptying the 10% member costs 100% of the
-  rule's traffic. Under the workaround below the same empty pool costs 10%.
-
-- **Not caught by conformance.** `GatewayWeightedAcrossTwoInferencePools` scores the
-  answering pod and the weight split. The round-robin fallback keeps both correct. Not run
-  here; assessed from the test source.
-- **A mixed `[InferencePool, Service]` rule is affected by the same overwrite** - a Service
-  backendRef yields a nil config and `route_collections.go:103` gates ext_proc on it for the
-  whole rule. Separate defect, not covered by this reproducer.
-
 ## Reproducer
 
+- A failing case for each shape, on a kind cluster, in about three minutes.
+- A pass/fail signal per request - the endpoint the picker chose against the pool that
+  actually served - so a fix is confirmed rather than assumed.
+- A way to run a candidate control plane against both without touching anything else:
+  `--istiod-image` swaps istiod alone and leaves the gateway on the released proxy.
+- An EnvoyFilter that restores per-pool picking on an unfixed build, generated from the
+  gateway's own route table.
+
+## Verification
+
+Reproducer is using the same cluster, same manifests, same `proxyv2:1.30.4`. istiod is the piece that is changed to demonstrate that fix works.
+
+| Route | Shape | Istio 1.30.4 | [#61601](https://github.com/istio/istio/pull/61601) |
+|---|---|---|---|
+| `collide-a` | two HTTPRoutes reusing one rule name | served pool-a, **picked by pool-b** | picked by pool-a |
+| `collide-b` | the other half of that pair | pool-b | pool-b |
+| `split` | one rule, two weighted pools | picker A invoked 0 of 100 | 38 a / 2 b, each by its own picker |
+
+Every request returned 200 in both columns. Nothing about the responses says which one you
+are looking at, which is the point.
+
+## Run it
+
 ```bash
-./setup.sh                         # kind + Istio + CRDs + workloads, ~45s
-./validate.sh                      # the three steps below, ~2 min
-./validate.sh --verbose            # plus the evidence each step rests on
-./setup.sh --istio-version 1.29.7  # another minor, same cluster
+./setup.sh                                            # kind + Istio + CRDs + workloads, ~45s
+./validate.sh                                         # the scenarios below, ~2 min
+./validate.sh --verbose                               # plus the evidence each step rests on
+
+./setup.sh --istio-version 1.29.7                     # another minor, same cluster
+./setup.sh --istiod-image localhost/pilot:pr61601     # a candidate control plane
 ```
 
-`./validate.sh` prints three results and nothing else:
+`--istiod-image` loads a locally built image and patches the istiod deployment only. The
+chart's `global.hub`/`global.tag` are deliberately not used: those also name the proxy image
+istiod provisions for the gateway, and every fix this spike is concerned with lives in pilot.
+The gateway keeps the released `proxyv2`, so a comparison run differs by the control plane
+alone.
+
+To build one from an Istio checkout:
+
+```bash
+HUB=localhost TAG=pr61601 BUILD_WITH_CONTAINER=0 make docker.pilot   # ~35s, istiod only
+```
+
+`./validate.sh` prints its results and nothing else:
 
 ```
   1. two InferencePools behind one HTTPRoute rule, split 9:1, both healthy
@@ -132,45 +101,142 @@ Consequences:
      which is what emptying a 10% member should cost
 ```
 
-`--verbose` adds the compiled route table, the per-request counts, the failed
-responses with their Envoy access-log fields, and the outage window. Assertions
-are silent unless they fail; the run exits non-zero if any does.
+Assertions are silent unless they fail; the run exits non-zero if any does. Raw results and
+image digests per run land in `results/istio-<version>/`.
 
-Step 3's EnvoyFilter is generated from the route table rather than checked in, because the
-pool cluster names embed a hash Istio derives from each InferencePool. To produce it without
-running the scenario:
+## Two failure scenarios
+
+### One rule, several pools
+
+`[pool-a weight 9, pool-b weight 1]`, both `InferencePool`, each with its own picker. The
+compiled route carries a single route-level override:
+
+```json
+"typed_per_filter_config": {
+  "envoy.filters.http.ext_proc": {
+    "overrides": {
+      "grpc_service": { "envoy_grpc": { "cluster_name": "outbound|9002||epp-b..." } },
+      "failure_mode_allow": false } } }
+```
+
+Neither `ClusterWeight` carries `typed_per_filter_config`. Note `failure_mode_allow` as well:
+the rule inherits one pool's picker *and* one pool's failure semantics, so a pool declaring
+`FailClose` runs `FailOpen` because another pool in the same rule said so.
+
+### Two routes, one rule name
+
+`collide-a` and `collide-b` share no backendRefs and carry no weights. What they share is a
+rule name, which Gateway API only requires to be unique within a single HTTPRoute - so this
+is valid, and it is what a controller emitting a fixed set of rule names produces for every
+service it manages. Istio keys the per-rule picker config by that name and merges the map
+across every route on the gateway, so the two entries collide while the matches stay distinct.
+
+This shape has no weighted split and therefore no round-robin fallback to soften it: a wrong
+picker is simply a wrong picker.
+
+## Is your own cluster affected?
+
+```bash
+kubectl exec -n <ns> <gateway-pod> -c istio-proxy -- \
+  curl -s 'localhost:15000/config_dump?resource=dynamic_route_configs' > rc.json
+```
+
+**One rule, two pools.** Lists any weighted rule whose picker sits at route level with none on
+its clusters - one picker for the whole rule:
+
+```bash
+jq -r '[.configs[].route_config.virtual_hosts[]?.routes[]?
+  | select(.route.weighted_clusters)
+  | {rule: .name,
+     route_picker: (.typed_per_filter_config."envoy.filters.http.ext_proc".overrides.grpc_service.envoy_grpc.cluster_name // null),
+     per_cluster: [.route.weighted_clusters.clusters[] | .typed_per_filter_config."envoy.filters.http.ext_proc" != null]}
+  | select(.route_picker != null and (.per_cluster | any | not))
+] | if length == 0 then "none" else .[] | .rule end' rc.json
+```
+
+**Two routes, one rule name.** Lists rule names used more than once, with the pool and the
+picker each one got. Different pools showing the *same* picker is the collision:
+
+```bash
+jq -r '[.configs[].route_config.virtual_hosts[]?.routes[]?
+  | select(.route.cluster != null and (.route.cluster | test("-ip-")))
+  | {rule: .name,
+     pool:   (.route.cluster | split("||")[1] // .route.cluster),
+     picker: (.typed_per_filter_config."envoy.filters.http.ext_proc".overrides.grpc_service.envoy_grpc.cluster_name // "none" | split("||")[1] // .)}]
+  | group_by(.rule) | map(select(length > 1))
+  | if length == 0 then ["no repeated rule names"] else
+      .[] | .[] | "\(.rule)  pool=\(.pool)  picker=\(.picker)" end' rc.json
+```
+
+On a fixed build the first prints `none` and the second pairs each pool with its own picker:
+
+```
+v1-completions-path  pool=pool-a-ip-8934303d...  picker=epp-a...
+v1-completions-path  pool=pool-b-ip-574c3c50...  picker=epp-b...
+```
+
+One picker name against two different pools is the bug.
+
+## Why
+
+Source at istio/istio `b1c58947`.
+
+| Fact | Where |
+|---|---|
+| `ExtProcPerRoute` is only ever constructed at route level | `route.go:514-521`, the sole non-test construction |
+| `ClusterWeight` never gets `TypedPerFilterConfig` | `processWeightedDestination`, `route.go:747` |
+| Picker is the last backendRef processed, unguarded overwrite | `conversion.go:1008` (`ipCfg = ipconfig`) |
+| Zero-weight refs pruned before that loop | `conversion.go:993` |
+| Merged routes overwrite by rule name | `route_collections.go:869` |
+
+Consequences:
+
+- **The winner is the last non-zero-weight backendRef.** Reordering backendRefs changes which
+  picker runs, and `weight: 0` removes a member from contention, so ownership moves during a
+  rollback to 0.
+- **Endpoint selection is discarded for the majority share.** The picker returns an endpoint
+  from its own pool; that host is not in the selected cluster; `override_host` falls back to
+  round robin. Load-aware routing is inoperative for traffic not bound to the picker's own
+  pool, with no error.
+- **One empty member fails the whole rule.** A picker with no ready endpoints must return
+  `ImmediateResponse` 503 ([EPP protocol](https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/main/docs/proposals/004-endpoint-picker-protocol/README.md)).
+  It does so for every request on the rule, so emptying the 10% member costs 100% of the
+  rule's traffic. Under the workaround below the same empty pool costs 10%.
+- **Not caught by conformance.** `GatewayWeightedAcrossTwoInferencePools` scores the answering
+  pod and the weight split. The round-robin fallback keeps both correct.
+- **A mixed `[InferencePool, Service]` rule is affected by the same overwrite** - a Service
+  backendRef yields a nil config and `route_collections.go:103` gates ext_proc on it for the
+  whole rule. Separate defect, not covered here.
+
+## Workaround for an unfixed build
+
+An EnvoyFilter placing an `ExtProcPerRoute` on each weighted cluster, naming that pool's
+picker. `INSERT_BEFORE` on `HTTP_ROUTE`: `REPLACE` does not exist for `HTTP_ROUTE` and `MERGE`
+appends to the repeated `clusters` field. It restores per-pool correlation and reduces the
+outage to the emptied member's weight share.
 
 ```bash
 ./render-envoyfilter.sh            # writes results/istio-<version>/envoyfilter-per-pool-extproc.yaml
 ./render-envoyfilter.sh --print    # to stdout
 ```
 
-It reads the gateway's own route table, finds every route splitting across two or more
-InferencePools under a single route-level override, and maps each pool cluster to its picker
-using the labels Istio puts on the Service it synthesises per pool
+Generated rather than checked in, because the pool cluster names embed a hash Istio derives
+per InferencePool. It reads the gateway's route table, finds every route splitting across two
+or more InferencePools under a single route-level override, and maps each pool cluster to its
+picker using the labels Istio puts on the Service it synthesises per pool
 (`istio.io/inferencepool-extension-service`). Nothing is keyed on naming, so it works against
 routes emitted by another controller - pointed at a KServe LLMInferenceService gateway it
 found 29 affected routes and mapped both pools without changes.
 
-k6 asserts the correlation per route:
+> [!IMPORTANT]
+> Not production-viable: cluster names embed Istio-generated hashes, it is per-route and
+> hand-maintained, and EnvoyFilter has no status reporting when it stops matching.
 
-```
-✗ [split]  endpoint chosen by the pool that served it   ↳ 15% — ✓ 15 / ✗ 85
-✓ [a-only] endpoint chosen by the pool that served it
-```
-
-Step 3 is what rules out "requests failed because pods were removed": same empty pool, same
-traffic, one config difference.
-
-The outage step drives a continuous probe across the drain and the refill rather than
-sampling a burst, so it reports the window - how long the rule was down, when the first
-failure landed relative to Envoy seeing zero endpoints, and that the rule recovers on its
-own.
+## Components and gotchas
 
 Real components throughout: `ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.10.0`, Gateway API
-conformance's `echo-basic`, `grafana/k6:2.2.0`. Results and image digests per run in
-`results/istio-<version>/`. Gateway Service is ClusterIP, traffic originates in-cluster: no
-MetalLB, no port-forward.
+conformance's `echo-basic`, `grafana/k6:2.2.0`. Gateway Service is ClusterIP and traffic
+originates in-cluster: no MetalLB, no port-forward.
 
 Two picker requirements, neither failure naming its cause:
 
@@ -179,37 +245,12 @@ Two picker requirements, neither failure naming its cause:
 - The picker selects a body parser by path suffix. `/a-only` returns
   `no parser registered matching path suffix` (400). Paths end `/v1/completions`.
 
-## Potential workaround
-
-An EnvoyFilter placing an `ExtProcPerRoute` on each weighted cluster, naming that pool's
-picker (`INSERT_BEFORE` on `HTTP_ROUTE`; `REPLACE` does not exist for `HTTP_ROUTE` and
-`MERGE` appends to the repeated `clusters` field). Restores per-pool correlation and reduces
-the outage to the emptied member's weight share.
-
-### How the patch is generated
-
-`render-envoyfilter.sh` was created to work around the issue. It:
-
-1. Reads the gateway's route table (`config_dump?resource=dynamic_route_configs`) and finds
-   every route that splits across two or more InferencePools under one route-level override -
-   the shape this defect produces, not a specific route name.
-2. Maps each pool's weighted cluster to its picker's cluster from the labels Istio itself
-   attaches to the Service it synthesises per InferencePool
-   (`istio.io/inferencepool-extension-service`, `-extension-port`). No naming convention is
-   assumed, so the same script identifies the affected routes on a KServe
-   LLMInferenceService gateway - 29 of them there, in one pass.
-3. Copies the compiled route's `overrides` object **whole**, and changes exactly one field
-   in the copy: `grpc_service.envoy_grpc.cluster_name`, to that pool's own picker.
-
-> [!IMPORTANT]
-> Not production-viable: cluster names embed Istio-generated hashes, it is per-route and
-hand-maintained, and EnvoyFilter has no status reporting when it stops matching.
-
-A fix would attach `ext_proc` config per backendRef rather than once per rule.
-
 ## References
 
 - [Endpoint Picker Protocol](https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/main/docs/proposals/004-endpoint-picker-protocol/README.md)
 - [`GatewayWeightedAcrossTwoInferencePools`](https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/main/conformance/tests/gateway_weighted_two_pools.go)
 - [`ExtProcPerRoute`](https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/http/ext_proc/v3/ext_proc.proto#envoy-v3-api-msg-extensions-filters-http-ext-proc-v3-extprocperroute)
 - [`OverrideHost` LB policy](https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/load_balancing_policies/override_host/v3/override_host.proto)
+- [istio#58392](https://github.com/istio/istio/issues/58392) / [#58393](https://github.com/istio/istio/pull/58393) - merged routes dropped later routes' picker config
+- [istio#61594](https://github.com/istio/istio/issues/61594) - one rule, several pools, one picker
+- [istio#61601](https://github.com/istio/istio/pull/61601) - resolves pickers per backendRef; verified against both shapes above
