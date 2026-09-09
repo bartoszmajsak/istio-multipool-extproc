@@ -53,26 +53,42 @@ Reproduced on Istio 1.29.7, 1.30.2 and 1.30.4 (Envoy 1.37.6-dev, 1.38.3-dev, 1.3
 
 ## Verification
 
-Reproducer is using the same cluster, same manifests, same `proxyv2:1.30.4`. istiod is the piece that is changed to demonstrate that fix works.
+Measured on 2026-09-09 using the same cluster, manifests and `proxyv2:1.30.4` image digest.
+The patched control plane is `quay.io/bmajsak/pilot:1.30.4-fix-61594`, which carries
+[#61601](https://github.com/istio/istio/pull/61601) on top of 1.30.4. Install it with the
+`--istiod-image` invocation below.
 
-| Route | Shape | Istio 1.30.4 | [#61601](https://github.com/istio/istio/pull/61601) |
-|---|---|---|---|
-| `collide-a` | two HTTPRoutes reusing one rule name | served pool-a, **picked by pool-b** | picked by pool-a |
-| `collide-b` | the other half of that pair | pool-b | pool-b |
-| `split` | one rule, two weighted pools | picker A invoked 0 of 100 | 35 a / 5 b, each by its own picker |
+For the weighted rule, split 9:1, pool B was scaled to zero:
 
-Every request returned 200 in both columns. Nothing about the responses says which one you
-are looking at, which is the point.
+| Control plane | Failures with pool B empty |
+|---|---|
+| Stock Istio 1.30.4 | **164/164**, including healthy pool A |
+| Stock + EnvoyFilter | **5/100**, all pool B |
+| Patched image | **23/164**, all pool B |
 
-The right-hand column is `quay.io/bmajsak/pilot:1.30.4-fix-61594`, which carries the change
-in #61601 on top of 1.30.4. Install it with the `--istiod-image` invocation below.
+The stock and patched counts cover requests sampled during the drained window; the
+EnvoyFilter count comes from a separate 100-request burst. The concurrent A-only control
+stayed healthy in both full runs. See the [stock results](results/istio-1.30.4/validate.out)
+and [patched results](results/istio-1.30.4+pilot-1.30.4-fix-61594/validate.out).
 
-`validate.sh` is a reproducer: its assertions expect the defect, so it reports failures
-against a control plane that no longer has it, which is the correct outcome for what it
-asserts and not a fix-validation. The right-hand column was measured by sending the same
-requests to `collide-a`, `collide-b` and the weighted rule and comparing, per request, the
-endpoint the picker selected against the pool that served it. Expectation modes that would
-let one runner both reproduce and accept a fix do not exist yet.
+The collision routes each reference only their own pool. They share no backendRefs;
+they share the rule name `v1-completions-path`:
+
+| Route | Stock Istio 1.30.4 | Patched image |
+|---|---|---|
+| `collide-a` → pool A | Served by A, **picked by B** | Served by A, picked by A |
+| `collide-b` → pool B | Served by B, picked by B | Served by B, picked by B |
+
+These additional probes sent 100 requests per route per image, all returning 200. On the
+patched image, every request reached exactly the endpoint its own picker selected. The
+weighted route also passed 100 such probes, giving 300/300 exact endpoint matches across
+the three routes. `validate.sh` does not exercise the collision routes, and their behavior
+during a pool outage was not tested.
+
+`validate.sh` is a reproducer: its assertions expect the defect. The stock run exited 0;
+the patched run exited 7 because the defect was absent. The per-request checks above
+independently verified the corrected behavior. Expectation modes that would let one runner
+both reproduce and accept a fix do not exist yet.
 
 ## Run it
 
