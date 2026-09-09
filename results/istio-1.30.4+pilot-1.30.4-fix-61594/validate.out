@@ -3,30 +3,80 @@ istio=1.30.4 envoy=1.38.4-dev
 Split:     pool-a=9 pool-b=1   requests per target: 100
 Gateway:   http://multipool-gw-multipool-istio.multipool-spike.svc.cluster.local   (host primary.example.com)
 Results:   /home/bartek/code/work/sandbox/istio-multipool-extproc/results/istio-1.30.4+pilot-1.30.4-fix-61594
+
+Scenario: bypass - one rule, two pools, one picker
 ==> 1/3  both pools healthy, 9:1 across two InferencePools
     sending 100 requests to the weighted rule, and 100 to pool-a's own route
+  ✓ [a-only] endpoint chosen by the pool that served it
+  ✓ [split] endpoint chosen by the pool that served it
+
+  compiled route  multipool-spike.split.0
+    route-level ext_proc override                  none
+    weighted cluster pool-a (weight 9)             ext_proc override: epp-a
+    weighted cluster pool-b (weight 1)             ext_proc override: epp-b
+
+  100 requests to the weighted rule
+    served by pool-a, endpoint chosen by picker a  89
+    served by pool-b, endpoint chosen by picker b  11
+
+  100 requests to pool-a's own single-pool route (the control)
+    served by pool-a, endpoint chosen by picker a  100
 FAIL: split: pool b's picker chose the endpoint for 100% of the rule, both pools' traffic included
 FAIL: split: 0 of 100 requests were served by one pool while the other pool's picker was consulted
 FAIL: route-level ext_proc override names epp-b (None)
 FAIL: no weighted cluster carries an ext_proc override (['pool-a', 'pool-b'])
-FAIL: every one of them was handed an endpoint from pool B by picker b (0 of 90)
+FAIL: every one of them was handed an endpoint from pool B by picker b (0 of 89)
+
+  Envoy's access log, for the 89 requests it routed to pool-a's cluster
+    picker asked for a pool-b endpoint             0
+    Envoy dialled a pool-a endpoint instead        89
+
+Scenario: outage - the winning picker has no endpoints
 ==> 2/3  scaling pool-b (the 10% canary) to zero, as during a rollout
     probing continuously for 70s across the drain and the refill
     pool-b has no endpoints
     scaling pool-b back up
     pool-b serving again; waiting for the probe to finish
-FAIL: split: nothing succeeded while pool b had no endpoints - including the 90% share whose weighted cluster is the healthy pool A (163 requests)
-FAIL: 0 of the 31 dead requests (0.0%, the healthy pool's own weight share) had already been routed to pool A's cluster when picker b refused on their behalf
+  ✗ [split] endpoint chosen by the pool that served it
+  ↳  91% — ✓ 1278 / ✗ 123
+  ✓ [a-only] endpoint chosen by the pool that served it
+FAIL: split: nothing succeeded while pool b had no endpoints - including the 90% share whose weighted cluster is the healthy pool A (164 requests)
+
+  while pool-b had no endpoints
+    requests to the weighted rule                  164, of which 23 failed
+    requests to pool-a's own route (the control)   164, of which 0 failed
+
+  split: 29 failed responses {'503': 29}
+    code   flags  dur   response_code_details    upstream_cluster       upstream_host
+    503    -      0     -                        pool-b-ip-574c3c50     -
+    503    -      1     -                        pool-b-ip-574c3c50     -
+    503    -      0     -                        pool-b-ip-574c3c50     -
+    503    -      1     -                        pool-b-ip-574c3c50     -
+    503    -      0     -                        pool-b-ip-574c3c50     -
+    ... 24 more
+    response_code_details                          {'-': 29}
+
+  which cluster Envoy had already chosen for the failed requests
+    pool-b                                         29
+FAIL: 0 of the 29 dead requests (0.0%, the healthy pool's own weight share) had already been routed to pool A's cluster when picker b refused on their behalf
+
+  the outage window
+    probe ran for                                  70s at a steady rate
+    continuous failure                             10.1s
+    first failure, relative to Envoy seeing zero endpoints -2.0s
+    last failure, relative to the pool regaining them -0.8s
+
+Scenario: fix - per-weighted-cluster ext_proc via EnvoyFilter
 ==> 3/3  same outage, with an EnvoyFilter giving each pool its own picker
     rendering the filter from the route Envoy is running
 no route splits across two or more InferencePools under a single route-level ext_proc override
 WARN: nothing to patch: no rule splits across two InferencePools under one picker
 
   1. two InferencePools behind one HTTPRoute rule, split 9:1, both healthy
-     pool-b's picker chose the endpoint for 10 of 100 requests, pool-a's for 90
+     pool-b's picker chose the endpoint for 11 of 100 requests, pool-a's for 89
      each pool's picker should choose for its own share, so 90 and 10
   2. pool-b (the 10% canary) scaled to zero, as during a rollout
-     22 of 163 requests on the rule failed over 10.6s, 0% of them bound for healthy pool-a
+     23 of 164 requests on the rule failed over 10.1s, 0% of them bound for healthy pool-a
      only pool-b's own 10% share should have failed, so about 16
 
   this control plane does not exhibit the defect

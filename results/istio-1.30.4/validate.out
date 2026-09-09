@@ -3,26 +3,106 @@ istio=1.30.4 envoy=1.38.4-dev
 Split:     pool-a=9 pool-b=1   requests per target: 100
 Gateway:   http://multipool-gw-multipool-istio.multipool-spike.svc.cluster.local   (host primary.example.com)
 Results:   /home/bartek/code/work/sandbox/istio-multipool-extproc/results/istio-1.30.4
+
+Scenario: bypass - one rule, two pools, one picker
 ==> 1/3  both pools healthy, 9:1 across two InferencePools
     sending 100 requests to the weighted rule, and 100 to pool-a's own route
+  ✓ [a-only] endpoint chosen by the pool that served it
+  ✗ [split] endpoint chosen by the pool that served it
+  ↳  8% — ✓ 8 / ✗ 92
+
+  compiled route  multipool-spike.split.0
+    route-level ext_proc override                  epp-b
+    weighted cluster pool-a (weight 9)             ext_proc override: none
+    weighted cluster pool-b (weight 1)             ext_proc override: none
+
+  100 requests to the weighted rule
+    served by pool-a, endpoint chosen by picker b  92
+    served by pool-b, endpoint chosen by picker b  8
+    one of them, verbatim                          
+    1788981228207 split 200 backend-a-679d48bf78-fxz64 10.244.0.85:3000 bypass.1788981228-split-0-2
+
+  100 requests to pool-a's own single-pool route (the control)
+    served by pool-a, endpoint chosen by picker a  100
+
+  Envoy's access log, for the 92 requests it routed to pool-a's cluster
+    picker asked for a pool-b endpoint             92
+    Envoy dialled a pool-a endpoint instead        92
+
+Scenario: outage - the winning picker has no endpoints
 ==> 2/3  scaling pool-b (the 10% canary) to zero, as during a rollout
     probing continuously for 70s across the drain and the refill
     pool-b has no endpoints
     scaling pool-b back up
     pool-b serving again; waiting for the probe to finish
+  ✗ [split] endpoint chosen by the pool that served it
+  ↳  0% — ✓ 13 / ✗ 1388
+  ✓ [a-only] endpoint chosen by the pool that served it
+
+  while pool-b had no endpoints
+    requests to the weighted rule                  164, of which 164 failed
+    requests to pool-a's own route (the control)   164, of which 0 failed
+
+  split: 220 failed responses {'503': 220}
+    code   flags  dur   response_code_details    upstream_cluster       upstream_host
+    503    -      1     -                        pool-b-ip-574c3c50     -
+    503    -      1     -                        pool-a-ip-8934303d     -
+    503    -      0     -                        pool-a-ip-8934303d     -
+    503    -      0     -                        pool-a-ip-8934303d     -
+    503    -      0     -                        pool-a-ip-8934303d     -
+    ... 215 more
+    response_code_details                          {'-': 219, 'no_healthy_upstream': 1}
+
+  which cluster Envoy had already chosen for the failed requests
+    pool-a                                         193
+    pool-b                                         27
+
+  the outage window
+    probe ran for                                  70s at a steady rate
+    continuous failure                             11.1s
+    first failure, relative to Envoy seeing zero endpoints -2.2s
+    last failure, relative to the pool regaining them -0.0s
+
+Scenario: fix - per-weighted-cluster ext_proc via EnvoyFilter
 ==> 3/3  same outage, with an EnvoyFilter giving each pool its own picker
     rendering the filter from the route Envoy is running
     patched route loaded; sending 100 requests
+  ✓ [split] endpoint chosen by the pool that served it
+
+  patched route  multipool-spike.split.0.fixed
+    route-level ext_proc override                  none
+    weighted cluster pool-a (weight 9)             ext_proc override: epp-a
+    weighted cluster pool-b (weight 1)             ext_proc override: epp-b
+
+  100 requests to the weighted rule, under the patch
+    served by pool-a, endpoint chosen by picker a  91
+    served by pool-b, endpoint chosen by picker b  9
+
+Scenario: fix - the outage re-run underneath the patch
     draining pool-b again, this time under the patch
+  ✗ [split] endpoint chosen by the pool that served it
+  ↳  95% — ✓ 95 / ✗ 5
+
+  the same outage, with the patch in place
+    HTTP 200                                       95
+    HTTP 503                                       5
+
+  split: 5 failed responses {'503': 5}
+    code   flags  dur   response_code_details    upstream_cluster       upstream_host
+    503    -      0     -                        pool-b-ip-574c3c50     -
+    503    -      0     -                        pool-b-ip-574c3c50     -
+    503    -      0     -                        pool-b-ip-574c3c50     -
+    503    -      0     -                        pool-b-ip-574c3c50     -
+    503    -      0     -                        pool-b-ip-574c3c50     -
 
   1. two InferencePools behind one HTTPRoute rule, split 9:1, both healthy
      pool-b's picker chose the endpoint for 100 of 100 requests, pool-a's for 0
      each pool's picker should choose for its own share, so 90 and 10
   2. pool-b (the 10% canary) scaled to zero, as during a rollout
-     164 of 164 requests on the rule failed over 10.8s, 93% of them bound for healthy pool-a
+     164 of 164 requests on the rule failed over 11.1s, 88% of them bound for healthy pool-a
      only pool-b's own 10% share should have failed, so about 16
   3. same outage, with an EnvoyFilter giving each pool its own picker
-     13 of 100 requests failed - pool-b's share only, pool-a served throughout
+     5 of 100 requests failed - pool-b's share only, pool-a served throughout
      which is what emptying a 10% member should cost
 
   every assertion held   evidence: /home/bartek/code/work/sandbox/istio-multipool-extproc/results/istio-1.30.4
