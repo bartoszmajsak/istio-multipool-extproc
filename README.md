@@ -65,7 +65,14 @@ Every request returned 200 in both columns. Nothing about the responses says whi
 are looking at, which is the point.
 
 The right-hand column is `quay.io/bmajsak/pilot:1.30.4-fix-61594`, which carries the change
-in #61601 on top of 1.30.4. Reproduce it with the `--istiod-image` invocation below.
+in #61601 on top of 1.30.4. Install it with the `--istiod-image` invocation below.
+
+`validate.sh` is a reproducer: its assertions expect the defect, so it reports failures
+against a control plane that no longer has it, which is the correct outcome for what it
+asserts and not a fix-validation. The right-hand column was measured by sending the same
+requests to `collide-a`, `collide-b` and the weighted rule and comparing, per request, the
+endpoint the picker selected against the pool that served it. Expectation modes that would
+let one runner both reproduce and accept a fix do not exist yet.
 
 ## Run it
 

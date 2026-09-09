@@ -327,6 +327,36 @@ def gate_split(rows, label, weight_a, weight_b):
 # Scenarios
 # --------------------------------------------------------------------------
 
+def check_selected_served(rows, access, label, what):
+    """The endpoint the picker chose is the endpoint Envoy dialled.
+
+    Comparing pool identities only asks whether the right pool answered, which the
+    round-robin fallback delivers on its own even when the picker's choice was
+    thrown away. That is the behaviour under test, so it is compared exactly: the
+    endpoint the client saw selected against upstream_host, the endpoint Envoy
+    actually connected to, for every request that succeeded.
+    """
+    by_id = {a.get("req_id"): a for a in access}
+    pairs, missing = [], 0
+    for r in rows:
+        if r["label"] != label or r["code"] != "200":
+            continue
+        log = by_id.get(r["req_id"])
+        served = (log or {}).get("upstream_host") or ""
+        chosen = r.get("selected") or ""
+        if not served or not chosen:
+            missing += 1
+            continue
+        pairs.append((chosen, served))
+    crossed = [(c, s) for c, s in pairs if c != s]
+    check(pairs and not crossed and missing == 0,
+          "%s: every successful request reached the endpoint its picker selected "
+          "(%d of %d, %d unmatched)%s"
+          % (what, len(pairs) - len(crossed), len(pairs), missing,
+             "" if not crossed else "; first mismatch chose %s, reached %s"
+             % crossed[0]))
+
+
 def scenario_bypass(args, rows, routes, access):
     n_split = n_ctl = args.requests
 
@@ -346,6 +376,7 @@ def scenario_bypass(args, rows, routes, access):
     check(set(p[1] for p in pairs_a) == {"a"},
           "a-only: every request consulted picker a, so it is answering and simply "
           "never asked about the weighted rule (%s)" % dict(pairs_a))
+    check_selected_served(rows, access, "a-only", "a-only")
 
     split, _, pairs = summarise(rows, "split")
     route = routes.get(args.split_route)
@@ -661,6 +692,7 @@ def scenario_fix(args, rows, routes, access, edits, stats, edits_doc=None):
     check({p[1] for p in pairs} == {"a", "b"},
           "both pickers now choose endpoints, where before the patch pool a's "
           "picker chose none at all (%s)" % dict(pairs))
+    check_selected_served(rows, access, "split", "under the patch")
     served_by_route = collections.Counter(
         r.get("route_name") for r in gate_access(rows, access, "split"))
     check(set(served_by_route) == {args.fixed_route},
