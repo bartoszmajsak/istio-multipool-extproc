@@ -90,7 +90,7 @@ the patched run exited 7 because the defect was absent. The per-request checks a
 independently verified the corrected behavior. Expectation modes that would let one runner
 both reproduce and accept a fix do not exist yet.
 
-## Run it
+## How to run it
 
 ```bash
 ./setup.sh                                            # kind + Istio + CRDs + workloads, ~45s
@@ -100,16 +100,6 @@ both reproduce and accept a fix do not exist yet.
 ./setup.sh --istio-version 1.29.7                     # another minor, same cluster
 ./setup.sh --istiod-image quay.io/bmajsak/pilot:1.30.4-fix-61594   # a candidate control plane
 ```
-
-`--istiod-image` takes a registry reference or a locally built image, pulling once if it is
-not already local and side-loading it either way, so a run does not depend on the cluster
-reaching a registry.
-
-It sets the image through the istiod chart's own `image` value, which names that container
-and nothing else. `global.hub`/`global.tag` would also name the proxy image istiod hands to
-the gateway, and only pilot is being replaced - the gateway keeps the released proxy, so a
-comparison differs by the control plane alone. Going through the chart also leaves the field
-owned by helm, so a second run upgrades over the first instead of conflicting with it.
 
 To build one from an Istio checkout instead:
 
@@ -157,7 +147,7 @@ being flipped: a mixed pair would be needed to demonstrate a `FailClose` pool ru
 
 ### Two routes, one rule name
 
-`collide-a` and `collide-b` share no backendRefs and carry no weights. What they share is a
+`collide-a` and `collide-b` share no `backendRef`s and carry no weights. What they share is a
 rule name, which Gateway API only requires to be unique within a single HTTPRoute - so this
 is valid, and it is what a controller emitting a fixed set of rule names produces for every
 service it manages. Istio keys the per-rule picker config by that name and merges the map
@@ -166,7 +156,7 @@ across every route on the gateway, so the two entries collide while the matches 
 This shape has no weighted split and therefore no round-robin fallback to soften it: a wrong
 picker is simply a wrong picker.
 
-## Cluster check
+## Cluster verification
 
 To see if your cluster setup still carries the bug, you can invoke the following commands:
 
@@ -234,9 +224,9 @@ One picker name against two different pools is the core issue.
   backendRef yields a nil config and `route_collections.go:103` gates ext_proc on it for the
   whole rule. Separate defect, not covered here.
 
-## Workaround for an unfixed build
+## Workaround
 
-An EnvoyFilter placing an `ExtProcPerRoute` on each weighted cluster, naming that pool's
+An `EnvoyFilter` placing an `ExtProcPerRoute` on each weighted cluster, naming that pool's
 picker. `INSERT_BEFORE` on `HTTP_ROUTE`: `REPLACE` does not exist for `HTTP_ROUTE` and `MERGE`
 appends to the repeated `clusters` field. It restores per-pool correlation and reduces the
 outage to the emptied member's weight share.
@@ -250,9 +240,7 @@ Generated rather than checked in, because the pool cluster names embed a hash Is
 per InferencePool. It reads the gateway's route table, finds every route splitting across two
 or more InferencePools under a single route-level override, and maps each pool cluster to its
 picker using the labels Istio puts on the Service it synthesises per pool
-(`istio.io/inferencepool-extension-service`). Nothing is keyed on naming, so it works against
-routes emitted by another controller - pointed at a KServe LLMInferenceService gateway it
-found 29 affected routes and mapped both pools without changes.
+(`istio.io/inferencepool-extension-service`).
 
 > [!IMPORTANT]
 > Not production-viable: cluster names embed Istio-generated hashes, it is per-route and
