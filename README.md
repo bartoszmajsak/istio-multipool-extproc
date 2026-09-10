@@ -166,7 +166,9 @@ across every route on the gateway, so the two entries collide while the matches 
 This shape has no weighted split and therefore no round-robin fallback to soften it: a wrong
 picker is simply a wrong picker.
 
-## Is your own cluster affected?
+## Cluster check
+
+To see if your cluster setup still carries the bug, you can invoke the following commands:
 
 ```bash
 kubectl exec -n <ns> <gateway-pod> -c istio-proxy -- \
@@ -207,21 +209,9 @@ v1-completions-path  pool=pool-a-ip-8934303d...  picker=epp-a...
 v1-completions-path  pool=pool-b-ip-574c3c50...  picker=epp-b...
 ```
 
-One picker name against two different pools is the bug.
+One picker name against two different pools is the core issue.
 
-## Why
-
-Source at istio/istio `b1c58947`.
-
-| Fact | Where |
-|---|---|
-| `ExtProcPerRoute` is only ever constructed at route level | `route.go:514-521`, the sole non-test construction |
-| `ClusterWeight` never gets `TypedPerFilterConfig` | `processWeightedDestination`, `route.go:747` |
-| Picker is the last backendRef processed, unguarded overwrite | `conversion.go:1008` (`ipCfg = ipconfig`) |
-| Zero-weight refs pruned before that loop | `conversion.go:993` |
-| Merged routes overwrite by rule name | `route_collections.go:869` |
-
-Consequences:
+## Consequences
 
 - **The winner is the last non-zero-weight backendRef.** Reordering backendRefs changes which
   picker runs, and `weight: 0` removes a member from contention, so ownership moves during a
@@ -267,19 +257,6 @@ found 29 affected routes and mapped both pools without changes.
 > [!IMPORTANT]
 > Not production-viable: cluster names embed Istio-generated hashes, it is per-route and
 > hand-maintained, and EnvoyFilter has no status reporting when it stops matching.
-
-## Components and gotchas
-
-Real components throughout: `ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.10.0`, Gateway API
-conformance's `echo-basic`, `grafana/k6:2.2.0`. Gateway Service is ClusterIP and traffic
-originates in-cluster: no MetalLB, no port-forward.
-
-Two picker requirements, neither failure naming its cause:
-
-- `--secure-serving` defaults to true. Istio dials plaintext h2c, so leaving it enabled
-  returns `ext_proc_error_gRPC_error_14 ... connection_termination` (500) on every request.
-- The picker selects a body parser by path suffix. `/a-only` returns
-  `no parser registered matching path suffix` (400). Paths end `/v1/completions`.
 
 ## References
 
