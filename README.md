@@ -5,8 +5,8 @@ once per request, "which replica should take this one?". That is the entire reas
 InferencePool. The picker knows which replica already has your prompt prefix cached and which
 one is drowning.
 
-So the gateway needs to ask the right pool's picker. There are two fairly ordinary ways it
-doesn't.
+So the gateway needs to ask the right pool's picker. There are two currently two issues in the 
+Istio implementation where it seems it doesn't do the right thing.
 
 **One rule, two pools.** The usual canary - 90/10 across two pools in a single route rule.
 Istio attaches one picker per *rule*, not per backend, so one pool's picker answers for all
@@ -18,9 +18,9 @@ rule  ->  90% pool-a  \
           10% pool-b  /
 ```
 
-**Two routes, one rule name.** Different services, different pools, nothing shared - except a
-rule name. Gateway API only asks that names be unique inside a single HTTPRoute, so reusing
-them across routes is perfectly legal. Istio keys each picker by that name and merges the
+**Two routes, one rule name.** Different services and different pools but the same rule name. 
+Gateway API only asks that names be unique inside a single HTTPRoute, so reusing
+them across routes seems perfectly legal. Istio keys each picker by that name and merges the
 routes, and whichever lands last takes the name, along with the other service's picker:
 
 ```
