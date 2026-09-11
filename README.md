@@ -53,10 +53,10 @@ Reproduced on Istio 1.29.7, 1.30.2 and 1.30.4 (Envoy 1.37.6-dev, 1.38.3-dev, 1.3
 
 ## Verification
 
-Measured on 2026-09-09 using the same cluster, manifests and `proxyv2:1.30.4` image digest.
-The patched control plane is `quay.io/bmajsak/pilot:1.30.4-fix-61594`, which carries
-[#61601](https://github.com/istio/istio/pull/61601) on top of 1.30.4. Install it with the
-`--istiod-image` invocation below.
+Measured on 2026-09-11 using the same cluster, manifests and `proxyv2:1.30.4` image digest.
+The patched control plane is `quay.io/bmajsak/pilot:1.30.4-fix-61594-v2`, which carries
+[#61601](https://github.com/istio/istio/pull/61601) on top of 1.30.4, including the review
+changes made to that PR. Install it with the `--istiod-image` invocation below.
 
 For the weighted rule, split 9:1, pool B was scaled to zero:
 
@@ -64,12 +64,14 @@ For the weighted rule, split 9:1, pool B was scaled to zero:
 |---|---|
 | Stock Istio 1.30.4 | **164/164**, including healthy pool A |
 | Stock + EnvoyFilter | **5/100**, all pool B |
-| Patched image | **23/164**, all pool B |
+| Patched image | **12/164**, all pool B |
 
-The stock and patched counts cover requests sampled during the drained window; the
-EnvoyFilter count comes from a separate 100-request burst. The concurrent A-only control
-stayed healthy in both full runs. See the [stock results](results/istio-1.30.4/validate.out)
-and [patched results](results/istio-1.30.4+pilot-1.30.4-fix-61594/validate.out).
+The stock and patched counts cover requests sampled during the drained window, so the
+patched figure moves run to run with how the drain lines up - 12 and 23 across two runs of
+the same image. What holds in every run is the attribution: none of the failures belonged
+to healthy pool A. The EnvoyFilter count comes from a separate 100-request burst. The
+concurrent A-only control stayed healthy in every full run. See the [stock results](results/istio-1.30.4/validate.out)
+and [patched results](results/istio-1.30.4+pilot-1.30.4-fix-61594-v2/validate.out).
 
 The collision routes each reference only their own pool. They share no backendRefs;
 they share the rule name `v1-completions-path`:
@@ -98,7 +100,7 @@ both reproduce and accept a fix do not exist yet.
 ./validate.sh --verbose                               # plus the evidence each step rests on
 
 ./setup.sh --istio-version 1.29.7                     # another minor, same cluster
-./setup.sh --istiod-image quay.io/bmajsak/pilot:1.30.4-fix-61594   # a candidate control plane
+./setup.sh --istiod-image quay.io/bmajsak/pilot:1.30.4-fix-61594-v2   # a candidate control plane
 ```
 
 To build one from an Istio checkout instead:
