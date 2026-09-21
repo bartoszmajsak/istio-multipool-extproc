@@ -158,6 +158,85 @@ across every route on the gateway, so the two entries collide while the matches 
 This shape has no weighted split and therefore no round-robin fallback to soften it: a wrong
 picker is simply a wrong picker.
 
+## Inspecting a live cluster
+
+Small pieces, usable on any cluster, not just this one.
+
+**Find the gateway pod.**
+
+```bash
+kubectl get pods -A -l gateway.networking.k8s.io/gateway-name \
+  -o custom-columns='NS:.metadata.namespace,POD:.metadata.name' --no-headers
+```
+
+**Which picker each pool is supposed to get.** Istio synthesises a headless Service per
+InferencePool and labels it with the pool's endpoint picker. This is the intended mapping,
+before any routing is involved:
+
+```bash
+kubectl get svc -A -l istio.io/inferencepool-name \
+  -o custom-columns='NS:.metadata.namespace,POOL:.metadata.labels.istio\.io/inferencepool-name,EPP:.metadata.labels.istio\.io/inferencepool-extension-service' --no-headers
+```
+
+**Grab the config the gateway is actually running.**
+
+```bash
+kubectl exec -n <ns> <gateway-pod> -c istio-proxy -- \
+  pilot-agent request GET config_dump > dump.json
+```
+
+**Which picker each route actually got.** One line per InferencePool-backed route, with the
+pools it sends to and the picker attached at route level and per weighted cluster:
+
+```bash
+jq -r '
+def short: if . == null then "-" else ((split("||")[1] // .) | split(".")[0]) end;
+def epp(o): (o."envoy.filters.http.ext_proc" // null)
+  | if . == null then "NONE"
+    elif .overrides.grpc_service.envoy_grpc.cluster_name then (.overrides.grpc_service.envoy_grpc.cluster_name | short)
+    elif .disabled then "disabled"
+    else "present" end;
+[ .configs[]
+  | select(."@type" | test("RoutesConfigDump"))
+  | (.dynamic_route_configs[]?.route_config, .static_route_configs[]?.route_config)
+  | .virtual_hosts[]? | .routes[]?
+  | { match: (.match.path // .match.prefix // .match.path_separated_prefix // "?"),
+      backends: ([.route.cluster] + [.route.weighted_clusters.clusters[]?.name]
+                 | map(select(. != null) | short) | join(",")),
+      route_epp: epp(.typed_per_filter_config // {}),
+      cluster_epp: ([.route.weighted_clusters.clusters[]? | epp(.typed_per_filter_config // {})] | join(",")) }
+  | select(.backends | test("-ip-|inference|pool"))
+]
+| .[] | "\(.match)\t\(.backends)\troute-epp=\(.route_epp)\tcluster-epp=\(if .cluster_epp == "" then "-" else .cluster_epp end)"
+' dump.json | column -t -s$'\t'
+```
+
+Reading the output:
+
+| what you see | what it means |
+|---|---|
+| `route-epp=NONE` on a pool-backed route | no picker attached at all - the EPP is never called and logs nothing |
+| one `route-epp` against two different pools | two routes share a rule name, one stole the other's picker |
+| two pools in `backends`, one `route-epp`, `cluster-epp=NONE,NONE` | one picker scores the whole rule |
+| each pool paired with its own `cluster-epp` | fixed build, per-backend pickers |
+
+**How many ext_proc filters are in the chain.** Relevant when something else also inserts
+ext_proc stages - the listener-level EPP filter is a placeholder (`cluster_name: dummy`) and
+only does anything when a route overrides it:
+
+```bash
+jq -r '
+  .configs[] | select(."@type" | test("ListenersConfigDump"))
+  | .dynamic_listeners[]?.active_state.listener as $l
+  | $l.filter_chains[]?.filters[]?
+  | select(.name == "envoy.filters.network.http_connection_manager")
+  | .typed_config.http_filters[]? | select((.name // "") | contains("ext_proc"))
+  | [$l.name, .name,
+     (.typed_config.grpc_service.envoy_grpc.cluster_name // "per-route"),
+     (.typed_config.processing_mode.request_body_mode // "default")]
+  | @tsv' dump.json | sort -u | column -t -s$'\t'
+```
+
 ## Cluster verification
 
 To see if your cluster setup still carries the bug, you can invoke the following commands:
