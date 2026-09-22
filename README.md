@@ -162,6 +162,44 @@ picker is simply a wrong picker.
 
 Small pieces, usable on any cluster, not just this one.
 
+**One report for the whole gateway.** Wraps everything below - status, the EnvoyFilters
+touching it, the filter chain, the picker each route got, and a verdict:
+
+```bash
+./scripts/check-gateway-ext-proc.sh <gateway-name> [namespace]
+```
+
+On a control plane carrying the defect:
+
+```
+Detection:
+  PROBLEM: 1 route(s) span several pools under a single route-level picker
+    - multipool-spike.split.0  pools=pool-a...,pool-b...  picker=epp-b...
+  PROBLEM: 2 route(s) share a rule name and carry the same picker for different pools
+    - v1-completions-path  pool=pool-a...  picker=epp-b...
+    - v1-completions-path  pool=pool-b...  picker=epp-b...
+  EPP mappings:
+    - epp-a...  -> pool-a...
+    - epp-b...  -> pool-a...        <- epp-b serving two pools is the fault
+                -> pool-b...
+```
+
+Once the pickers are right - either patched, or on a fixed control plane:
+
+```
+Detection:
+  OK: all 4 InferencePool-backed route(s) have a picker matching their own pool
+  EPP mappings:
+    - epp-a...  -> pool-a...
+    - epp-b...  -> pool-b...
+```
+
+An EPP appearing against more than one pool in that mapping is the fault in one line. The
+verdict judges only the route that actually serves each path: Envoy takes the first match, so
+a shadowed duplicate left behind by the workaround is not a finding.
+
+The rest of this section is what the script runs, for when you want one piece on its own.
+
 **Find the gateway pod.**
 
 ```bash
