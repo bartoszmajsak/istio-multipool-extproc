@@ -220,6 +220,44 @@ Reading the output:
 | two pools in `backends`, one `route-epp`, `cluster-epp=NONE,NONE` | one picker scores the whole rule |
 | each pool paired with its own `cluster-epp` | fixed build, per-backend pickers |
 
+**Why a wrong picker is silent.** Each pool cluster load balances with `override_host`,
+which reads the endpoint the picker named and *skips it when it is not a member of that
+cluster*, falling through to the policy below. That fallback is what keeps the requests
+succeeding:
+
+```bash
+kubectl exec -n <ns> <gateway-pod> -c istio-proxy -- \
+  curl -s 'localhost:15000/config_dump?resource=dynamic_active_clusters' \
+| jq -r '.configs[].cluster | select(.name | test("-ip-")) |
+  "\(.name | split("||")[1] | split(".")[0])  lb=\(.lb_policy)  policy=\(
+     .load_balancing_policy.policies[0].typed_extension_config.name // "-" | split(".") | last)  fallback=\(
+     .load_balancing_policy.policies[0].typed_extension_config.typed_config.fallback_policy.policies[0].typed_extension_config.name // "-" | split(".") | last)"'
+```
+
+```
+pool-a-ip-8934303d  lb=CLUSTER_PROVIDED  policy=override_host  fallback=round_robin
+pool-b-ip-574c3c50  lb=CLUSTER_PROVIDED  policy=override_host  fallback=round_robin
+```
+
+**Which endpoints each pool actually holds.** The sets are disjoint, which is why an endpoint
+named by another pool's picker is never a member and always falls through:
+
+```bash
+kubectl exec -n <ns> <gateway-pod> -c istio-proxy -- \
+  curl -s 'localhost:15000/clusters?format=json' \
+| jq -r '.cluster_statuses[] | select(.name | test("-ip-")) |
+  "\(.name | split("||")[1] | split(".")[0])  \([.host_statuses[]?.address.socket_address.address] | sort | join(" "))"'
+```
+
+```
+pool-a-ip-8934303d  10.244.0.6 10.244.0.7 10.244.0.8
+pool-b-ip-574c3c50  10.244.0.9 10.244.0.10 10.244.0.11
+```
+
+Put together: the picker names an address, the cluster it was routed to does not contain it,
+`override_host` drops it, round robin answers instead. Status codes and the weighted split
+stay correct, so nothing downstream reports the loss.
+
 **How many ext_proc filters are in the chain.** Relevant when something else also inserts
 ext_proc stages - the listener-level EPP filter is a placeholder (`cluster_name: dummy`) and
 only does anything when a route overrides it:
