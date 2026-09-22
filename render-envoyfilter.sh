@@ -127,6 +127,46 @@ for config in json.load(open(dump_path)).get("configs", []):
             if len(pooled) >= 2 and route_override(route):
                 targets.append((vhost["name"], route))
 
+def single_pool_cluster(route):
+    """The InferencePool cluster of a route with exactly one backend, or None."""
+    action = key(route, "route") or {}
+    cluster = action.get("cluster")
+    return cluster if cluster in pickers else None
+
+
+def route_path(route):
+    m = key(route, "match") or {}
+    for k in ("path", "prefix", "path_separated_prefix", "pathSeparatedPrefix"):
+        if m.get(k):
+            return m[k]
+    return None
+
+
+# The other shape: two routes that share a rule name, each with a single pool, where
+# the picker attached does not belong to that route's own pool. Istio merges the picker
+# map by rule name, so the loser carries the winner's picker.
+collisions = []
+for config in json.load(open(dump_path)).get("configs", []):
+    for vhost in config.get("route_config", {}).get("virtual_hosts", []):
+        by_name = {}
+        for route in vhost.get("routes", []):
+            by_name.setdefault(route.get("name"), []).append(route)
+        for name, routes in by_name.items():
+            if len(routes) < 2:
+                continue
+            for route in routes:
+                pool = single_pool_cluster(route)
+                override = route_override(route)
+                if not pool or not override:
+                    continue
+                want = pickers[pool]
+                grpc = key(override, "grpc_service", "grpcService") or {}
+                envoy_grpc = key(grpc, "envoy_grpc", "envoyGrpc") or {}
+                have = key(envoy_grpc, "cluster_name", "clusterName")
+                if have != want and route_path(route):
+                    collisions.append((vhost["name"], route, want))
+
+
 # One patch per (vhost, route name). Istio matches a route by exact string
 # equality on its name, so a table carrying the same rule name more than once -
 # which KServe's controller emits - cannot have those occurrences targeted
@@ -143,12 +183,13 @@ for vhost_name, route in targets:
     unique.append((vhost_name, route))
 duplicated = len(targets) - len(unique)
 targets = unique
-if not targets:
+if not targets and not collisions:
     # Exit 3, not 1: there is nothing wrong here, there is simply nothing to patch.
     # The caller reports it as a finding about the control plane rather than a failure
     # to produce the filter.
     sys.stderr.write("no route splits across two or more InferencePools under a single "
-                     "route-level ext_proc override\n")
+                     "route-level ext_proc override, and no two routes share a rule name "
+                     "while carrying each other's picker\n")
     sys.exit(3)
 
 
@@ -210,6 +251,34 @@ for vhost_name, original in targets:
     })
     report.append({"route": orig_name, "vhost": vhost_name,
                    "source_overrides": source, "edits": edits})
+
+# A colliding route needs no restructuring - only the picker it was given swapped for
+# its own. The patch cannot select between the two routes by name, because sharing a
+# name is the defect. Instead the corrected route is inserted ahead of them carrying its
+# own path match, and Envoy's first-match-wins ordering does the disambiguation.
+for vhost_name, original, want in collisions:
+    orig_name = original["name"]
+    source = route_override(original)
+    fixed = json.loads(json.dumps(original))
+    fixed["name"] = orig_name + ".fixed"
+
+    for spelling in ("typed_per_filter_config", "typedPerFilterConfig"):
+        if spelling in fixed and EXT_PROC in fixed[spelling]:
+            fixed[spelling][EXT_PROC] = {"@type": PER_ROUTE_TYPE,
+                                         "overrides": override_naming(source, want)}
+            break
+
+    patches.append({
+        "applyTo": "HTTP_ROUTE",
+        "match": {"context": "GATEWAY",
+                  "routeConfiguration": {
+                      "vhost": {"name": vhost_name, "route": {"name": orig_name}}}},
+        "patch": {"operation": "INSERT_BEFORE", "value": fixed},
+    })
+    report.append({"route": orig_name, "vhost": vhost_name,
+                   "path": route_path(original), "source_overrides": source,
+                   "edits": [{"edit": "rename", "from": orig_name, "to": fixed["name"]},
+                             {"edit": "repoint-route-level-ext_proc", "picker": want}]})
 
 envoy_filter = {
     "apiVersion": "networking.istio.io/v1alpha3",

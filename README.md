@@ -307,25 +307,53 @@ One picker name against two different pools is the core issue.
 
 ## Workaround
 
-An `EnvoyFilter` placing an `ExtProcPerRoute` on each weighted cluster, naming that pool's
-picker. `INSERT_BEFORE` on `HTTP_ROUTE`: `REPLACE` does not exist for `HTTP_ROUTE` and `MERGE`
-appends to the repeated `clusters` field. It restores per-pool correlation and reduces the
-outage to the emptied member's weight share.
+One `EnvoyFilter` covers both scenarios. `INSERT_BEFORE` on `HTTP_ROUTE` in both cases:
+`REPLACE` does not exist for `HTTP_ROUTE` and `MERGE` appends to the repeated `clusters`
+field. What gets inserted differs by shape.
 
 ```bash
 ./render-envoyfilter.sh            # writes results/istio-<version>/envoyfilter-per-pool-extproc.yaml
 ./render-envoyfilter.sh --print    # to stdout
+kubectl apply -f results/istio-<version>/envoyfilter-per-pool-extproc.yaml
 ```
 
+**One rule, two pools.** The inserted copy drops the route-level override and puts an
+`ExtProcPerRoute` on each weighted cluster naming that pool's own picker. A backend that is
+not an InferencePool gets `disabled`, so no picker claims traffic belonging to no pool. This
+restores per-pool correlation and reduces the outage to the emptied member's weight share.
+
+**Two routes, one rule name.** The inserted copy keeps its single backend and only swaps the
+picker for the one its own pool owns. The patch cannot select between the two routes by name,
+because sharing a name is the defect - `routeConfiguration.vhost.route.name` is the only
+selector `EnvoyFilter` offers. Instead the corrected route is inserted ahead of both, carrying
+its own path match, and Envoy's first-match-wins ordering does the disambiguation. The
+original stays in the table, shadowed for that path.
+
+Only routes actually carrying the wrong picker are patched, so a collision where the loser
+happens to already hold its own picker produces nothing.
+
 Generated rather than checked in, because the pool cluster names embed a hash Istio derives
-per InferencePool. It reads the gateway's route table, finds every route splitting across two
-or more InferencePools under a single route-level override, and maps each pool cluster to its
-picker using the labels Istio puts on the Service it synthesises per pool
+per InferencePool. It reads the gateway's route table, finds both shapes, and maps each pool
+cluster to its picker using the labels Istio puts on the Service it synthesises per pool
 (`istio.io/inferencepool-extension-service`).
+
+Verify it took by re-reading the route table - the corrected copies sort ahead of the
+originals:
+
+```
+ord path                      route-epp  cluster-epp
+  0  /weighted-two-pools-test   -          ['epp-a', 'epp-b']   <- inserted
+  1  /weighted-two-pools-test   epp-b      ['-', '-']           <- original, shadowed
+  2  /collide-a                 epp-a      []                   <- inserted
+  3  /collide-a                 epp-b      []                   <- original, shadowed
+```
 
 > [!IMPORTANT]
 > Not production-viable: cluster names embed Istio-generated hashes, it is per-route and
-> hand-maintained, and EnvoyFilter has no status reporting when it stops matching.
+> hand-maintained, and EnvoyFilter has no status reporting when it stops matching. The
+> collision patches additionally depend on each colliding route having a distinct path match
+> to key on, and on their relative order being safe to front-run - a table with catch-alls
+> needs checking by hand.
 
 ## References
 
