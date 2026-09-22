@@ -63,22 +63,37 @@ jq -r '.configs[] | select(."@type" | test("ClustersConfigDump"))
   | "  - " + .' "$DUMP" | sort -u
 
 echo ""
-echo "Inference routes:"
+echo "Routes on this gateway, in the order Envoy evaluates them:"
 jq -r '
   def epp: (."envoy.filters.http.ext_proc" // null)
     | if . == null then "NONE"
-      elif .overrides.grpc_service.envoy_grpc.cluster_name then .overrides.grpc_service.envoy_grpc.cluster_name
+      elif .overrides.grpc_service.envoy_grpc.cluster_name then (.overrides.grpc_service.envoy_grpc.cluster_name | split("||")[1] // .)
       elif .disabled then "DISABLED" else "present" end;
-  .configs[] | select(."@type" | test("RoutesConfigDump"))
-  | (.dynamic_route_configs[]?.route_config, .static_route_configs[]?.route_config)
-  | .virtual_hosts[]? | .routes[]?
-  | . as $r
-  | ([$r.route.cluster] + [$r.route.weighted_clusters.clusters[]?.name] | map(select(.)) ) as $backends
-  | select($backends | any(test("-ip-|inference|pool")))
-  | "  - \($r.name) | backend=\($backends | join(",")) | EPP=\(($r.typed_per_filter_config // {}) | epp)"
-      + (if ($r.route.weighted_clusters.clusters // []) | length > 0
-         then " | per-cluster=" + ([$r.route.weighted_clusters.clusters[] | (.typed_per_filter_config // {}) | epp] | join(","))
-         else "" end)' "$DUMP" | sort
+  def short: if . == null then "-" else (split("||")[1] // .) end;
+  [ .configs[] | select(."@type" | test("RoutesConfigDump"))
+    | (.dynamic_route_configs[]?.route_config, .static_route_configs[]?.route_config)
+    | .virtual_hosts[]? as $vh | $vh.routes[]?
+    | . as $r
+    | { vhost: $vh.name,
+        name: $r.name,
+        path: (($r.match.path // $r.match.prefix // $r.match.path_separated_prefix // ($r.match.safe_regex.regex // null) // "?") | tostring),
+        backends: ([$r.route.cluster] + [$r.route.weighted_clusters.clusters[]?.name] | map(select(.) | short)),
+        pooled: ([$r.route.cluster] + [$r.route.weighted_clusters.clusters[]?.name] | map(select(. and test("-ip-"))) | length > 0),
+        epp: (($r.typed_per_filter_config // {}) | epp),
+        per_cluster: [$r.route.weighted_clusters.clusters[]? | (.typed_per_filter_config // {}) | epp] } ]
+  | to_entries
+  | map(.value + {idx: .key})
+  # a route is unreachable if an earlier route already claims its path
+  | . as $all
+  | map(. as $e | $e + {shadowed: (([$all[] | select(.vhost == $e.vhost and .path == $e.path)] | .[0].idx) < $e.idx)})
+  | .[]
+  | "  [\(.idx)] \(.path)"
+    + (if (.name // "") != "" then "  \(.name)" else "" end)
+    + "  backend=\(.backends | join(","))"
+    + "  epp=\(.epp)"
+    + (if (.per_cluster | length) > 0 then "  per-cluster=\(.per_cluster | join(","))" else "" end)
+    + (if .pooled then "" else "  <- no InferencePool, EPP not involved by design" end)
+    + (if .shadowed then "  <- SHADOWED by an earlier route on this path" else "" end)' "$DUMP"
 
 echo ""
 echo "Detection:"
@@ -89,41 +104,45 @@ jq -r '
       elif .disabled then "DISABLED" else "present" end;
   [ .configs[] | select(."@type" | test("RoutesConfigDump"))
     | (.dynamic_route_configs[]?.route_config, .static_route_configs[]?.route_config)
-    | .virtual_hosts[]? | .routes[]?
+    | .virtual_hosts[]? as $vh | $vh.routes[]?
     | . as $r
-    | ([$r.route.cluster] + [$r.route.weighted_clusters.clusters[]?.name] | map(select(. and test("-ip-")))) as $pools
-    | select($pools | length > 0)
-    | { name: $r.name,
-        path: (($r.match.path // $r.match.prefix // $r.match.path_separated_prefix // $r.match.safe_regex.regex // "?") | tostring),
-        pools: $pools,
+    | { vhost: $vh.name,
+        name: $r.name,
+        path: (($r.match.path // $r.match.prefix // $r.match.path_separated_prefix // ($r.match.safe_regex.regex // null) // "?") | tostring),
+        pools: ([$r.route.cluster] + [$r.route.weighted_clusters.clusters[]?.name] | map(select(. and test("-ip-")))),
+        svc_backends: ([$r.route.cluster] + [$r.route.weighted_clusters.clusters[]?.name] | map(select(. and (test("-ip-") | not)))),
         route_epp: (($r.typed_per_filter_config // {}) | epp),
         cluster_epp: [$r.route.weighted_clusters.clusters[]? | (.typed_per_filter_config // {}) | epp] } ]
-  # Envoy takes the first route whose match wins, so a later route on the same path
-  # is unreachable. Judging the table means judging only what actually serves.
-  | (group_by(.path) | map(.[0])) as $routes
-  | ($routes | length) as $total
-  | ($routes | map(select(.route_epp == "NONE" and (.cluster_epp | map(select(. != "NONE")) | length) == 0))) as $missing
-  | ($routes | map(select((.pools | length) > 1 and .route_epp != "NONE"
+  # Envoy serves the first route matching a path; later duplicates never run.
+  | (group_by(.vhost + "\u0000" + .path) | map(.[0])) as $live
+  | ($live | map(select(.pools | length > 0))) as $pooled
+  | ($live | map(select((.pools | length) == 0 and (.svc_backends | length) > 0))) as $bypass
+  | ($pooled | map(select(.route_epp == "NONE" and ((.cluster_epp | map(select(. != "NONE")) | length) == 0)))) as $missing
+  | ($pooled | map(select((.pools | length) > 1 and .route_epp != "NONE"
                           and ((.cluster_epp | map(select(. != "NONE")) | length) == 0)))) as $multipool
-  | ($routes | map(select(.route_epp != "NONE")) | group_by(.name)
+  | ($pooled | map(select(.route_epp != "NONE")) | group_by(.name)
      | map(select(length > 1 and ([.[].route_epp] | unique | length) == 1
                   and ([.[].pools[0]] | unique | length) > 1)) | flatten) as $collide
-  | (if ($missing | length) > 0 then
-        "  PROBLEM: \($missing|length) of \($total) InferencePool-backed route(s) have NO endpoint picker",
-        ($missing[] | "    - \(.name)  pools=\(.pools|join(","))")
-     else empty end),
-    (if ($multipool | length) > 0 then
-        "  PROBLEM: \($multipool|length) route(s) span several pools under a single route-level picker",
-        ($multipool[] | "    - \(.name)  pools=\(.pools|join(","))  picker=\(.route_epp)")
-     else empty end),
-    (if ($collide | length) > 0 then
-        "  PROBLEM: \($collide|length) route(s) share a rule name and carry the same picker for different pools",
-        ($collide[] | "    - \(.name)  pool=\(.pools[0])  picker=\(.route_epp)")
-     else empty end),
-    (if (($missing|length) + ($multipool|length) + ($collide|length)) == 0 then
-        "  OK: all \($total) InferencePool-backed route(s) have a picker matching their own pool"
-     else empty end),
-    "  EPP mappings:",
-    ($routes | map(select(.route_epp != "NONE")) | group_by(.route_epp)[]
-     | "    - \(.[0].route_epp)", ("      -> " + ([.[].pools[]] | unique | join("\n      -> "))))' "$DUMP"
+  | (if ($missing|length) > 0 then
+       "  PROBLEM: \($missing|length) pool-backed route(s) have NO endpoint picker",
+       ($missing[] | "    - [\(.path)] \(.name)") else empty end),
+    (if ($multipool|length) > 0 then
+       "  PROBLEM: \($multipool|length) route(s) span several pools under a single route-level picker",
+       ($multipool[] | "    - [\(.path)] \(.name)  picker=\(.route_epp | split("||")[1] // .)") else empty end),
+    (if ($collide|length) > 0 then
+       "  PROBLEM: \($collide|length) route(s) share a rule name and carry the same picker for different pools",
+       ($collide[] | "    - [\(.path)] \(.name)  pool=\(.pools[0] | split("||")[1] // .)  picker=\(.route_epp | split("||")[1] // .)") else empty end),
+    (if (($missing|length)+($multipool|length)+($collide|length)) == 0 then
+       "  OK: all \($pooled|length) pool-backed route(s) have a picker matching their own pool" else empty end),
+    (if ($bypass|length) > 0 then
+       "",
+       "  NOTE: \($bypass|length) reachable route(s) have no InferencePool backend. Traffic matching",
+       "  these never reaches an endpoint picker - that is correct for them, but if requests are",
+       "  arriving here instead of on a pool-backed route, the EPP will look bypassed:",
+       ($bypass[] | "    - [\(.path)] \(.name) -> \(.svc_backends | join(","))") else empty end),
+    "",
+    "  EPP mappings (a picker against more than one pool is the fault):",
+    ($pooled | map(select(.route_epp != "NONE")) | group_by(.route_epp)[]
+     | "    - \(.[0].route_epp | split("||")[1] // .)",
+       ("      -> " + ([.[].pools[] | split("||")[1] // .] | unique | join("\n      -> "))))' "$DUMP"
 rm -f "$DUMP"
